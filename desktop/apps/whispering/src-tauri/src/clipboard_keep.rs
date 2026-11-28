@@ -586,26 +586,46 @@ mod platform {
     const RESTORED: &[&str] = &["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard", RESTORED_MARKER];
 
     pub fn write_text(text: &str, transient: bool) -> Result<Option<u64>, String> {
-        let Some(_open) = Open::new() else {
-            return Err("the clipboard is busy".into());
-        };
-        unsafe {
-            // Allocated before clearing, so a failure leaves the clipboard as it was.
-            let Some(text) = Global::text(text) else {
-                return Err("no memory for the text".into());
+        {
+            let Some(_open) = Open::new() else {
+                return Err("the clipboard is busy".into());
             };
-            if EmptyClipboard() == 0 {
-                return Err("the clipboard couldn't be cleared".into());
-            }
-            if !text.set(CF_UNICODETEXT) {
-                return Err("the text couldn't be put on the clipboard".into());
-            }
-            if transient {
-                set_markers(TRANSIENT);
+            unsafe {
+                // Allocated before clearing, so a failure leaves the clipboard as it was.
+                let Some(text) = Global::text(text) else {
+                    return Err("no memory for the text".into());
+                };
+                if EmptyClipboard() == 0 {
+                    return Err("the clipboard couldn't be cleared".into());
+                }
+                if !text.set(CF_UNICODETEXT) {
+                    return Err("the text couldn't be put on the clipboard".into());
+                }
+                if transient {
+                    set_markers(TRANSIENT);
+                }
             }
         }
-        // Read before closing: nothing else can have written in between.
+        // Read after closing: Windows may add its synthesized formats (the
+        // locale, the other text formats) when the clipboard is closed, and
+        // the number later checks compare with is the one after that.
         Ok(sequence())
+    }
+
+    /// Test only: the clipboard's Unicode text.
+    #[cfg(test)]
+    pub fn read_text() -> Option<String> {
+        let _open = Open::new()?;
+        unsafe {
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if handle.is_null() {
+                return None;
+            }
+            let bytes = read_global(handle, usize::MAX)??;
+            let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_ne_bytes([c[0], c[1]])).collect();
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            Some(String::from_utf16_lossy(&units[..end]))
+        }
     }
 
     pub fn rewrite_plain(text: &str, seq_after_write: Option<u64>) -> Restored {
@@ -777,16 +797,25 @@ mod platform {
     }
 
     /// Clears the pasteboard and writes the items. Returns the change count
-    /// that clearing gave this write (Apple: the count to compare later to
-    /// know whether we still own the pasteboard), or None if it failed.
+    /// once written (what later checks compare with), or None if it failed.
     fn write_items(pasteboard: &NSPasteboard, items: Vec<Retained<NSPasteboardItem>>) -> Option<u64> {
         // This Mac only: what VoiceLnq writes is never sent to other devices
         // (Universal Clipboard).
-        let owned = pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+        pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
         let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
             items.into_iter().map(ProtocolObject::from_retained).collect();
         let array = NSArray::from_retained_slice(&objects);
-        pasteboard.writeObjects(&array).then_some(owned as u64)
+        pasteboard.writeObjects(&array).then(|| change_count(pasteboard))
+    }
+
+    /// Test only: the clipboard's plain text.
+    #[cfg(test)]
+    pub fn read_text() -> Option<String> {
+        autoreleasepool(|_| {
+            general()
+                .stringForType(unsafe { NSPasteboardTypeString })
+                .map(|s| s.to_string())
+        })
     }
 
     fn text_item(text: &str, transient: bool) -> Retained<NSPasteboardItem> {
@@ -875,6 +904,11 @@ mod platform {
     pub struct Contents;
 
     pub fn sequence() -> Option<u64> {
+        None
+    }
+
+    #[cfg(test)]
+    pub fn read_text() -> Option<String> {
         None
     }
 
@@ -1023,6 +1057,48 @@ mod tests {
             None
         );
         assert_eq!(calls, 4);
+    }
+
+    /// The real clipboard, end to end: save, transient write, restore, a
+    /// clipboard changed meanwhile, the transcript kept. It overwrites the
+    /// clipboard, so it runs only on CI (GITHUB_ACTIONS), where the clipboard
+    /// is nobody's; elsewhere it returns at once.
+    #[test]
+    fn ci_real_clipboard_round_trip() {
+        if std::env::var_os("GITHUB_ACTIONS").is_none() || cfg!(not(any(target_os = "windows", target_os = "macos"))) {
+            return;
+        }
+        let original = "Buy oat milk and call the plumber (original)";
+        platform::write_text(original, false).expect("write the original");
+        assert_eq!(platform::read_text().as_deref(), Some(original));
+
+        let Snapshot::Saved(saved) = snapshot() else {
+            panic!("a plain text clipboard should be saved");
+        };
+        let seq = write_transient("Alex Example dictated this").expect("transient write");
+        let seq = seq.expect("a sequence number");
+        assert_eq!(sequence(), Some(seq), "the number returned is the clipboard's number afterwards");
+        assert_eq!(platform::read_text().as_deref(), Some("Alex Example dictated this"));
+
+        assert_eq!(restore(&saved, seq, "Alex Example dictated this"), Restored::All);
+        assert_eq!(platform::read_text().as_deref(), Some(original), "the original came back");
+
+        // Put back once more after its own restore (the markers it added
+        // must not make it look private).
+        let Snapshot::Saved(again) = snapshot() else {
+            panic!("a clipboard VoiceLnq put back should be saved again");
+        };
+
+        // Someone copied something meanwhile: left alone.
+        let seq = write_transient("second dictation").unwrap().unwrap();
+        platform::write_text("copied by the person", false).unwrap();
+        assert_eq!(restore(&again, seq, "second dictation"), Restored::ChangedSince);
+        assert_eq!(platform::read_text().as_deref(), Some("copied by the person"));
+
+        // Nothing pasted: the transcript stays, as an ordinary entry.
+        let seq = write_transient("third dictation").unwrap();
+        assert_eq!(keep_transcript("third dictation", seq), Restored::All);
+        assert_eq!(platform::read_text().as_deref(), Some("third dictation"));
     }
 
     /// Saves the real clipboard and prints what was saved (never contents).
