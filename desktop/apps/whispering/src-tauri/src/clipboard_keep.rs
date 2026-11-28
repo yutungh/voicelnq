@@ -255,6 +255,9 @@ pub(crate) fn win_format(format: u32, name: Option<&str>) -> WinFormat {
         | CF_DSPMETAFILEPICT | CF_DSPENHMETAFILE => WinFormat::Skip,
         // CF_PRIVATEFIRST..=CF_PRIVATELAST: the system doesn't own them.
         0x0200..=0x02FF => WinFormat::Skip,
+        // CF_GDIOBJFIRST..=CF_GDIOBJLAST: Microsoft's pages disagree on
+        // whether Windows frees these handles, so they are never replayed.
+        0x0300..=0x03FF => WinFormat::Unrestorable,
         CF_ENHMETAFILE => WinFormat::Emf,
         CF_LOCALE => WinFormat::Bookkeeping,
         _ => match name {
@@ -950,10 +953,13 @@ mod tests {
         }
         assert_eq!(win_format(14, None), Emf);
         assert_eq!(win_format(16, None), Bookkeeping); // CF_LOCALE
-        // Text, DIB, DIBV5, file lists, the GDIOBJ range (HGLOBAL).
-        for f in [1, 7, 8, 13, 15, 17, 0x300] {
+        // Text, DIB, DIBV5, file lists.
+        for f in [1, 7, 8, 13, 15, 17] {
             assert_eq!(win_format(f, None), Content, "{f:#x}");
         }
+        // The GDIOBJ range: its handles' ownership is unclear, never replayed.
+        assert_eq!(win_format(0x300, None), Unrestorable);
+        assert_eq!(win_format(0x3FF, None), Unrestorable);
         for name in ["HTML Format", "Rich Text Format", "PNG", "Preferred DropEffect", "Shell IDList Array"] {
             assert_eq!(win_format(0xC100, Some(name)), Content, "{name}");
         }

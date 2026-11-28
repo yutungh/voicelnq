@@ -50,6 +50,7 @@
 				accelerator,
 				command.id,
 				Object.fromEntries(commands.map((c) => [c.id, settings.value[`shortcuts.global.${c.id}`]])),
+				IS_MACOS,
 			);
 			if (takenBy) {
 				const other = commands.find((c) => c.id === takenBy)?.title ?? 'another shortcut';

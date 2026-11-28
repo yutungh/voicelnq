@@ -279,6 +279,14 @@ describe('Paste last transcription (0.9.23)', () => {
 		expect(shortcutTakenBy('Control+Alt+V', 'pasteLastTranscription', assigned)).toBeNull();
 		expect(shortcutTakenBy('Control+Alt+B', 'pasteLastTranscription', assigned)).toBeNull();
 		expect(sameKeys('Control+Alt+V', 'Control+Shift+V')).toBe(false);
+		// Older settings name modifiers by alias.
+		expect(sameKeys('CommandOrControl+Shift+R', 'Control+Shift+R')).toBe(true);
+		expect(sameKeys('CommandOrControl+Shift+R', 'Command+Shift+R', true)).toBe(true);
+		expect(sameKeys('CommandOrControl+Shift+R', 'Command+Shift+R')).toBe(false);
+		expect(sameKeys('Ctrl+Option+V', 'Alt+Control+V')).toBe(true);
+		expect(
+			shortcutTakenBy('Control+Shift+R', 'pasteLastTranscription', { runTransformationOnClipboard: 'CommandOrControl+Shift+R' }),
+		).toBe('runTransformationOnClipboard');
 		const keyRow = read('..', 'vf', 'settings', 'KeyRow.svelte');
 		expect(keyRow).toContain('shortcutTakenBy(');
 	});

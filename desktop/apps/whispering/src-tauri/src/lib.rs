@@ -474,6 +474,9 @@ async fn write_text(
         tokio::time::sleep(tokio::time::Duration::from_millis(PASTE_SETTLE_MS)).await;
     }
 
+    // Whether the text is on the clipboard when nothing was pasted: not when
+    // someone else wrote the clipboard meanwhile (the page then copies it).
+    let mut text_on_clipboard = true;
     match kept {
         // 0.9.23: put the clipboard back later, holding the lock until then.
         Some((saved, seq)) if keys_sent => {
@@ -492,6 +495,7 @@ async fn write_text(
             })
             .await;
             log::info!("[paste] not pasted; the text stays on the clipboard: {outcome:?}");
+            text_on_clipboard = !matches!(outcome, Ok(clipboard_keep::Restored::ChangedSince));
         }
         None => {}
     }
@@ -504,10 +508,11 @@ async fn write_text(
             log::info!("[paste] pasted ({shortcut:?})");
             PasteResult::pasted()
         }
-        KeyOutcome::Refused(reason) => PasteResult::copied(Some(reason)),
+        KeyOutcome::Refused(reason) if text_on_clipboard => PasteResult::copied(Some(reason)),
+        KeyOutcome::Refused(reason) => PasteResult { pasted: false, copied: false, reason: Some(reason), error: None },
         KeyOutcome::NotSent(error) => {
             log::warn!("[paste] no keys sent: {error}");
-            PasteResult::failed(true, error)
+            PasteResult::failed(text_on_clipboard, error)
         }
     })
 }

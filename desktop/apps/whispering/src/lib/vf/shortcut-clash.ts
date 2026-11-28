@@ -5,12 +5,39 @@
  * unit tested.
  */
 
-/** "Control+Alt+V" and "alt+control+v" are the same keys. */
-export function sameKeys(a: string, b: string): boolean {
+/**
+ * One name per modifier, as the system registers it: older settings may
+ * say CommandOrControl (Command on a Mac, Control elsewhere), Ctrl, Cmd,
+ * Option or Super.
+ */
+function modifierName(part: string, isMac: boolean): string {
+	switch (part) {
+		case 'commandorcontrol':
+		case 'cmdorctrl':
+		case 'cmdorcontrol':
+		case 'commandorctrl':
+			return isMac ? 'command' : 'control';
+		case 'ctrl':
+			return 'control';
+		case 'cmd':
+		case 'meta':
+		case 'super':
+			return isMac ? 'command' : 'super';
+		case 'command':
+			return isMac ? 'command' : 'super';
+		case 'option':
+			return 'alt';
+		default:
+			return part;
+	}
+}
+
+/** "Control+Alt+V", "alt+control+v" and "CommandOrControl+Alt+V" (on Windows) are the same keys. */
+export function sameKeys(a: string, b: string, isMac = false): boolean {
 	const norm = (keys: string) => {
 		const parts = keys.split('+').map((p) => p.trim().toLowerCase());
 		const key = parts.pop() ?? '';
-		return [...parts.sort(), key].join('+');
+		return [...parts.map((p) => modifierName(p, isMac)).sort(), key].join('+');
 	};
 	return norm(a) === norm(b);
 }
@@ -23,9 +50,10 @@ export function shortcutTakenBy(
 	keys: string,
 	commandId: string,
 	assigned: Readonly<Record<string, string | null | undefined>>,
+	isMac = false,
 ): string | null {
 	for (const [id, other] of Object.entries(assigned)) {
-		if (id !== commandId && other && sameKeys(other, keys)) return id;
+		if (id !== commandId && other && sameKeys(other, keys, isMac)) return id;
 	}
 	return null;
 }
