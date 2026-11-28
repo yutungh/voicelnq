@@ -37,6 +37,7 @@ import {
 	type DeliveryOutcome,
 	delivery,
 	onUseCleaned,
+	pasteLastTranscription,
 	placeText,
 	reportDelivered,
 } from './delivery';
@@ -852,6 +853,15 @@ export const commands = {
 			if (next === 'stop') return await stopManualRecording.execute(undefined);
 			if (next === 'start')
 				return await startManualRecording.execute({ purpose: 'feedback' });
+			return Ok(undefined);
+		},
+	}),
+
+	// VoiceFlow 0.9.23: paste the newest dictation again.
+	pasteLastTranscription: defineMutation({
+		mutationKey: ['commands', 'pasteLastTranscription'] as const,
+		mutationFn: async () => {
+			await pasteLastTranscription();
 			return Ok(undefined);
 		},
 	}),

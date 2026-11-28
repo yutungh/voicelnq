@@ -58,7 +58,9 @@ describe('Kept your words', () => {
 			copied: { keys: 'Ctrl+V', why: null },
 			keptWords: { reason: 'swapped', styleName: 'Casual' },
 		});
-		expect(noticeFor(machine.view()!)!.detail).toContain('Copied: press Ctrl+V to paste.');
+		expect(noticeFor(machine.view()!)!.detail).toContain(
+			"Couldn't paste — transcription copied to clipboard. Press Ctrl+V to paste.",
+		);
 	});
 
 	test('an ordinary delivery offers no Use cleaned, and Use cleaned clears it', () => {

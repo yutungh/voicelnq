@@ -24,7 +24,8 @@ function setup() {
 }
 
 describe('Copied notice (nowhere to paste)', () => {
-	test('says "Copied", what to press and why', () => {
+	// 0.9.23: "Couldn't paste · transcription copied to clipboard".
+	test('says it couldn\'t paste, that it was copied, what to press and why', () => {
 		const { machine } = setup();
 		machine.delivered('r', 'copied', {
 			app: null,
@@ -34,12 +35,12 @@ describe('Copied notice (nowhere to paste)', () => {
 		const view = machine.view()!;
 		expect(view.phase).toBe('copied');
 		const notice = noticeFor(view)!;
-		expect(notice.title).toBe('Copied');
-		expect(notice.aside).toBe('press Ctrl+V');
+		expect(notice.title).toBe("Couldn't paste");
+		expect(notice.aside).toBe('transcription copied to clipboard');
 		expect(notice.detail).toBe(
-			'Copied. Press Ctrl+V to paste. The desktop was in front. It is also in History.',
+			"Couldn't paste — transcription copied to clipboard. The desktop was in front. Press Ctrl+V to paste. It is also in History.",
 		);
-		expect(notice.tone).toBe('ok');
+		expect(notice.tone).toBe('warn');
 	});
 
 	test('hides itself', () => {
@@ -55,6 +56,8 @@ describe('Copied notice (nowhere to paste)', () => {
 		machine.delivered('r', 'copied', { app: null, text: 'x' });
 		const notice = noticeFor(machine.view()!)!;
 		expect(notice.aside).toBe('ready to paste');
+		expect(notice.title).toBe('Copied');
+		expect(notice.title).not.toContain("Couldn't paste");
 		expect(machine.view()!.copied).toBeNull();
 	});
 

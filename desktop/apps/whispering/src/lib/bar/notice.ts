@@ -5,6 +5,7 @@
  * unit tested.
  */
 import type { BarAction, DictationState } from './contract';
+import { COPIED_INSTEAD } from '../privacy/policy';
 
 export type NoticeTone = 'ok' | 'quiet' | 'warn' | 'bad';
 export type NoticeIcon = 'check-circle' | 'copy' | 'warning' | 'warning-circle' | 'x-circle';
@@ -71,7 +72,9 @@ export function noticeFor(view: NoticeView): Notice | null {
 				? view.pastedInto
 					? `Pasted into ${view.pastedInto}.`
 					: 'Pasted.'
-				: `Copied: press ${view.copied?.keys ?? 'Ctrl+V'} to paste.`;
+				: view.copied
+					? `${COPIED_INSTEAD} Press ${view.copied.keys} to paste.`
+					: 'Copied: press Ctrl+V to paste.';
 		return {
 			tone: 'warn',
 			icon: 'warning',
@@ -104,18 +107,30 @@ export function noticeFor(view: NoticeView): Notice | null {
 				closable: false,
 			};
 		case 'copied': {
-			// 0.9.11: "Copied. Press Ctrl+V to paste." and why, in the tooltip.
 			const keys = view.copied?.keys ?? null;
+			if (keys) {
+				// 0.9.23: a paste was meant to happen and the text was copied
+				// instead: "Couldn't paste · transcription copied to clipboard",
+				// with why in the tooltip.
+				return {
+					tone: 'warn',
+					icon: 'copy',
+					title: "Couldn't paste",
+					aside: 'transcription copied to clipboard',
+					detail: [COPIED_INSTEAD, view.copied?.why, `Press ${keys} to paste. It is also in History.`]
+						.filter(Boolean)
+						.join(' '),
+					buttons: pick(view, [{ action: 'feedback', label: 'Feedback' }]),
+					closable,
+				};
+			}
+			// Pasting is turned off: copied on purpose.
 			return {
 				tone: 'ok',
 				icon: 'copy',
 				title: 'Copied',
-				aside: keys ? `press ${keys}` : 'ready to paste',
-				detail: keys
-					? [`Copied. Press ${keys} to paste.`, view.copied?.why, 'It is also in History.']
-							.filter(Boolean)
-							.join(' ')
-					: 'Your words are on the clipboard. Paste them where you want them.',
+				aside: 'ready to paste',
+				detail: 'Your words are on the clipboard. Paste them where you want them.',
 				buttons: pick(view, [{ action: 'feedback', label: 'Feedback' }]),
 				closable,
 			};

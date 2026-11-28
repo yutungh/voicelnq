@@ -2,8 +2,10 @@ import { Ok } from 'wellcrafted/result';
 import { defineMutation } from '$lib/query/client';
 import { settings } from '$lib/stores/settings.svelte';
 import {
+	COPIED_INSTEAD,
 	deliveryNotice,
 	deliveryResult,
+	restoreFor,
 	copiedWhy,
 	type DeliveryResult,
 	type NativePasteResult,
@@ -18,13 +20,16 @@ import { bar } from '$lib/bar/controller';
 import { noteEvidence } from '$lib/feedback/evidence-store';
 import { problemNoticeIds } from '$lib/components/notification-log';
 import { driftReasonText } from '$lib/vf/drift-check';
+import { lastTranscriptText } from '$lib/vf/last-transcription';
+import { services } from '$lib/services';
 
 /**
  * VoiceFlow C1 (design B3.1 "Notices"), 0.9.11: delivery tells the person
  * only what happened. A paste is confirmed quietly ("Pasted into Telegram");
- * when there was nowhere to paste, the text is copied ("Copied. Press Ctrl+V
- * to paste.", which hides itself); "Not pasted" is left for a real failure
- * where the text is not on the clipboard either. The result is kept on the
+ * when there was nowhere to paste, the text is copied (0.9.23: "Couldn't
+ * paste — transcription copied to clipboard.", which hides itself); "Not
+ * pasted" is left for a real failure where the text is not on the clipboard
+ * either. The result is kept on the
  * dictation so Home and History show it too.
  */
 
@@ -58,13 +63,16 @@ function messageOf(error: object): string {
 
 /**
  * Pastes or copies the text (0.9.11), as `decidePaste` says for the window
- * in front now, and reports what actually happened. The text ends on the
- * clipboard in both cases.
+ * in front now, and reports what actually happened. Not pasted: the text is
+ * on the clipboard. Pasted: since 0.9.23 the previous clipboard is put back
+ * (Keep my clipboard after pasting), else the text stays there.
  */
 export async function placeText(
 	text: string,
 	paste: PasteContext | undefined,
 	traceId?: string,
+	/** 0.9.23: Paste last transcription borrows the clipboard even when unsure. */
+	{ alwaysRestore = false }: { alwaysRestore?: boolean } = {},
 ): Promise<DeliveryResult> {
 	const decision = await authorizePaste(paste);
 	if (traceId) dictationTiming.markRecording(traceId, 'paste-checked');
@@ -72,6 +80,9 @@ export async function placeText(
 		text,
 		binding: decision.paste ? decision.binding : undefined,
 		shortcut: decision.paste ? decision.shortcut : undefined,
+		// 0.9.23: a confident paste puts the person's own clipboard back; an
+		// unsure one leaves the text there (`restoreFor`).
+		restore: restoreFor(decision, settings.value['paste.keepClipboard'], alwaysRestore),
 	});
 	let native: NativePasteResult | null = error ? null : data;
 	const failure = error ? messageOf(error) : (data?.error ?? null);
@@ -185,7 +196,8 @@ export async function reportDelivered({
 		rpc.notify.info.execute({
 			id: toastId,
 			title: 'Kept your words',
-			description: `${keptWordsDetail(keptWords)} Use cleaned copies the tidied text; History keeps it too.`,
+			// 0.9.23: a copy instead of a paste says so here too.
+			description: `${delivered.result === 'copied' ? `${COPIED_INSTEAD} ` : ''}${keptWordsDetail(keptWords)} Use cleaned copies the tidied text; History keeps it too.`,
 			action: {
 				type: 'button',
 				label: 'Use cleaned',
@@ -254,7 +266,7 @@ async function deliver(
 
 	if (settings.value[`${kind}.writeToCursorOnSuccess`]) {
 		// 0.9.11: paste where the cursor is, or copy when there is nowhere to
-		// paste; either way the text ends on the clipboard.
+		// paste. 0.9.23: after a paste the previous clipboard comes back.
 		const delivered = await placeText(text, paste, traceId);
 		if (delivered.result === 'pasted' && settings.value[`${kind}.simulateEnterAfterOutput`]) {
 			const { error: enterError } = await rpc.text.simulateEnterKeystroke.execute();
@@ -366,6 +378,40 @@ async function deliver(
 		});
 	}
 	return 'done';
+}
+
+/** 0.9.23: one Paste last transcription at a time (a held key repeats). */
+let pastingLast = false;
+
+/**
+ * VoiceFlow 0.9.23: "Paste last transcription" (a global shortcut). Pastes
+ * the newest dictation's text where the cursor is, borrowing the clipboard
+ * and putting it back, as a confident paste does. Nowhere to paste: it is
+ * copied, with the notice. The dictation itself isn't changed.
+ */
+export async function pasteLastTranscription(): Promise<void> {
+	if (pastingLast) return;
+	pastingLast = true;
+	try {
+		const { data: recordings } = await services.db.recordings.getAll();
+		const text = lastTranscriptText(recordings ?? []);
+		if (!text) {
+			rpc.notify.info.execute({
+				title: 'Nothing to paste yet',
+				description: 'Your next dictation can be pasted again with this key.',
+			});
+			return;
+		}
+		const delivered = await placeText(text, { target: null, restoreFocus: false }, undefined, {
+			alwaysRestore: true,
+		});
+		const notice = deliveryNotice(delivered);
+		// Shown whether or not the bar is on: this paste has no bar of its own.
+		if (delivered.result === 'copied') rpc.notify.info.execute(notice);
+		else if (delivered.result === 'not-pasted') rpc.notify.warning.execute(notice);
+	} finally {
+		pastingLast = false;
+	}
 }
 
 export const delivery = {

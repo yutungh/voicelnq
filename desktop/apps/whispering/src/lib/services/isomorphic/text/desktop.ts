@@ -28,13 +28,14 @@ export function createTextServiceDesktop(): TextService {
 					}),
 			}),
 
-		writeToCursor: async (text, binding, shortcut) =>
+		writeToCursor: async (text, binding, shortcut, restore) =>
 			tryAsync({
 				try: () =>
 					invoke<PasteOutcome>('write_text', {
 						text,
 						binding: binding ?? null,
 						shortcut: shortcut ?? null,
+						restore: restore ?? null,
 					}),
 				catch: (error) =>
 					TextServiceErr({

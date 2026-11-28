@@ -52,6 +52,26 @@ pub enum PasswordCheck {
     NotChecked,
 }
 
+/// VoiceFlow 0.9.23: whether the focused element takes text, read at paste
+/// time only. The paste rule (`decidePaste` in policy.ts) uses it three ways:
+/// editable means a confident paste (the clipboard is put back afterwards);
+/// not editable in File Explorer or Finder means nowhere to paste; anything
+/// else is unsure (pasted, and the text stays on the clipboard, since a
+/// spreadsheet cell or a terminal can take a paste without looking editable).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FocusField {
+    /// A text box, a document, or a writable value.
+    Editable,
+    /// Checked: the focused element (or nothing) takes no text.
+    NotEditable,
+    /// The check couldn't tell. Never stops a paste.
+    Unknown,
+}
+
+/// How long the paste-time field check may take.
+const FIELD_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetSnapshot {
@@ -93,6 +113,10 @@ pub struct TargetSnapshot {
     /// keys VoiceFlow sends it. None: it could not be read. Elsewhere false.
     #[serde(default)]
     pub higher_integrity: Option<bool>,
+    /// VoiceFlow 0.9.23: the paste-time field check (`FocusField`); None
+    /// when it wasn't asked.
+    #[serde(default)]
+    pub focus_field: Option<FocusField>,
 }
 
 impl TargetSnapshot {
@@ -116,6 +140,7 @@ impl TargetSnapshot {
             profile_title_denied: false,
             window_class: None,
             higher_integrity: None,
+            focus_field: None,
         }
     }
 }
@@ -208,12 +233,48 @@ pub fn capture_now(app: &tauri::AppHandle, check_password: bool) -> TargetSnapsh
     snapshot
 }
 
+/// Pure: whether the paste-time field check is asked: any app that was
+/// identified and isn't VoiceLnq itself.
+pub fn field_check_applies(snapshot: &TargetSnapshot) -> bool {
+    snapshot.resolved && !snapshot.is_self
+}
+
+/// Pure: the file managers, where "no text field" is a trustworthy answer
+/// that means nowhere to paste: explorer.exe on Windows (File Explorer, the
+/// desktop), Finder on macOS (which also owns the desktop).
+pub fn is_file_manager(snapshot: &TargetSnapshot) -> bool {
+    match snapshot.platform.as_str() {
+        "windows" => snapshot.exe_name.as_deref() == Some("explorer.exe"),
+        "macos" => snapshot
+            .bundle_id
+            .as_deref()
+            .is_some_and(|b| b.eq_ignore_ascii_case("com.apple.finder")),
+        _ => false,
+    }
+}
+
 /// Snapshot of the app the user is in right now. Call it first thing at the
 /// hotkey, before VoiceFlow shows anything, and again at paste time.
+///
+/// VoiceFlow 0.9.23: `check_field` (paste time only) adds the field check.
 #[tauri::command]
-pub async fn capture_target(app: tauri::AppHandle, check_password: Option<bool>) -> TargetSnapshot {
+pub async fn capture_target(
+    app: tauri::AppHandle,
+    check_password: Option<bool>,
+    check_field: Option<bool>,
+) -> TargetSnapshot {
     let check = check_password.unwrap_or(true);
-    let result = tokio::task::spawn_blocking(move || capture_now(&app, check)).await;
+    let field = check_field.unwrap_or(false);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut snapshot = capture_now(&app, check);
+        if field && field_check_applies(&snapshot) {
+            let answer = platform::field_check(&snapshot, FIELD_CHECK_TIMEOUT);
+            log::info!("[paste] field check: {answer:?}");
+            snapshot.focus_field = Some(answer);
+        }
+        snapshot
+    })
+    .await;
     match result {
         Ok(snapshot) => snapshot,
         Err(e) => {
@@ -266,6 +327,15 @@ pub enum PasteRefusal {
     TargetChanged,
     /// The focused element is a password field now.
     PasswordField,
+    /// VoiceFlow 0.9.23: File Explorer or Finder with no text field focused now.
+    NoField,
+}
+
+/// Pure: File Explorer or Finder whose focused element positively takes no
+/// text: nowhere to paste. Anywhere else, or an answer that couldn't tell,
+/// never refuses.
+pub fn nowhere_to_paste(snapshot: &TargetSnapshot, field: FocusField) -> bool {
+    field == FocusField::NotEditable && is_file_manager(snapshot)
 }
 
 /// Pure decision: may the keystroke go to the app observed right now?
@@ -320,25 +390,36 @@ pub fn check_paste_binding_around(
 /// VoiceFlow 0.9.11: also returns the password-field answer, and logs the
 /// exact reason for a refusal (which sample failed, the window and process
 /// expected and seen, the password answer; never a title).
-pub fn verify_paste_binding(binding: &PasteBinding) -> (Result<(), PasteRefusal>, PasswordCheck) {
+///
+/// VoiceFlow 0.9.23: also re-reads the focused field (between the two
+/// identity samples): File Explorer or Finder with no text field refuses
+/// (`NoField`), and the answer decides whether a confident paste's clipboard
+/// is put back (`clipboard_keep::restore_allowed`).
+pub fn verify_paste_binding(
+    binding: &PasteBinding,
+) -> (Result<(), PasteRefusal>, PasswordCheck, Option<FocusField>) {
     let before = platform::identity();
     if !before.resolved || before.is_self {
         log::warn!(
             "[paste] refused before the keystroke: {}",
             refusal_detail(binding, &before, PasswordCheck::NotChecked, None)
         );
-        return (Err(PasteRefusal::TargetChanged), PasswordCheck::NotChecked);
+        return (Err(PasteRefusal::TargetChanged), PasswordCheck::NotChecked, None);
     }
     let password = settled_password_check();
+    let field = platform::field_check(&before, FIELD_CHECK_TIMEOUT);
     let after = platform::identity();
-    let verdict = check_paste_binding_around(binding, &before, password, &after);
+    let mut verdict = check_paste_binding_around(binding, &before, password, &after);
+    if verdict.is_ok() && nowhere_to_paste(&before, field) {
+        verdict = Err(PasteRefusal::NoField);
+    }
     if verdict.is_err() {
         log::warn!(
-            "[paste] refused before the keystroke: {}",
+            "[paste] refused before the keystroke: {} field={field:?}",
             refusal_detail(binding, &before, password, Some(&after))
         );
     }
-    (verdict, password)
+    (verdict, password, Some(field))
 }
 
 /// One log line saying why a bound paste was refused. Window handles,
@@ -370,6 +451,7 @@ pub fn refusal_detail(
             "window before the check"
         }
         Err(PasteRefusal::PasswordField) => "password check",
+        Err(PasteRefusal::NoField) => "no text field",
         Err(PasteRefusal::TargetChanged) => "window after the check",
     };
     format!(
@@ -381,6 +463,50 @@ pub fn refusal_detail(
         password,
         after.map_or("-".to_string(), sample),
     )
+}
+
+/// Pure (macOS roles, tested everywhere): does an element with this role,
+/// subrole and value settability take text? `value_settable` None: the
+/// settability call failed, so it couldn't tell.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn ax_field_kind(role: &str, subrole: Option<&str>, value_settable: Option<bool>) -> FocusField {
+    const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
+    // A slider's value is settable too: only a text role counts, and then
+    // only when its value can be set (a read-only field can't).
+    if !(TEXT_ROLES.contains(&role) || subrole == Some("AXSearchField")) {
+        return FocusField::NotEditable;
+    }
+    match value_settable {
+        Some(true) => FocusField::Editable,
+        Some(false) => FocusField::NotEditable,
+        None => FocusField::Unknown,
+    }
+}
+
+/// Pure (the Windows UI Automation answers, tested everywhere): does the
+/// focused element take text? `value_read_only`: its Value pattern's
+/// IsReadOnly (None: no Value pattern). `text_read_only`: reads its Text
+/// pattern's IsReadOnly (Ok(None): no Text pattern; Err: the call failed or
+/// the answer was mixed), asked only when the rest can't decide.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn uia_field_kind(
+    is_edit: bool,
+    value_read_only: Option<bool>,
+    text_read_only: impl FnOnce() -> Result<Option<bool>, ()>,
+) -> FocusField {
+    match value_read_only {
+        Some(false) => return FocusField::Editable,
+        Some(true) if is_edit => return FocusField::NotEditable,
+        _ => {}
+    }
+    match text_read_only() {
+        Ok(Some(false)) => FocusField::Editable,
+        Ok(Some(true)) => FocusField::NotEditable,
+        // An Edit control with neither pattern: a plain edit box.
+        Ok(None) if is_edit => FocusField::Editable,
+        Ok(None) => FocusField::NotEditable,
+        Err(()) => FocusField::Unknown,
+    }
 }
 
 fn file_name_lower(path: &str) -> String {
@@ -586,12 +712,18 @@ mod platform {
 
     // --- Tier C: UI Automation on one long-lived worker thread -------------
 
-    type Reply = mpsc::Sender<PasswordCheck>;
+    /// What the worker is asked. 0.9.23: the field check is its own request,
+    /// so the password check's 100 ms budget is untouched; it carries a
+    /// deadline, and the worker drops it unasked once that has passed.
+    enum Request {
+        Password(mpsc::Sender<PasswordCheck>),
+        Field(mpsc::Sender<FocusField>, Instant),
+    }
 
-    fn worker() -> &'static Mutex<mpsc::Sender<Reply>> {
-        static WORKER: OnceLock<Mutex<mpsc::Sender<Reply>>> = OnceLock::new();
+    fn worker() -> &'static Mutex<mpsc::Sender<Request>> {
+        static WORKER: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
         WORKER.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<Reply>();
+            let (tx, rx) = mpsc::channel::<Request>();
             std::thread::Builder::new()
                 .name("voiceflow-uia".into())
                 .spawn(move || uia_loop(rx))
@@ -600,7 +732,7 @@ mod platform {
         })
     }
 
-    fn uia_loop(rx: mpsc::Receiver<Reply>) {
+    fn uia_loop(rx: mpsc::Receiver<Request>) {
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
         };
@@ -610,7 +742,20 @@ mod platform {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
         };
-        for reply in rx {
+        for request in rx {
+            let reply = match request {
+                Request::Password(reply) => reply,
+                Request::Field(reply, deadline) => {
+                    if Instant::now() < deadline {
+                        let answer = match &automation {
+                            None => FocusField::Unknown,
+                            Some(automation) => unsafe { focused_field(automation) },
+                        };
+                        let _ = reply.send(answer);
+                    }
+                    continue;
+                }
+            };
             let result = match &automation {
                 None => PasswordCheck::Unavailable,
                 Some(automation) => unsafe {
@@ -636,11 +781,75 @@ mod platform {
         }
     }
 
+    /// VoiceFlow 0.9.23: does the focused element take text?
+    /// - An Edit control does, unless its Value pattern says read-only.
+    /// - Any control with a writable Value pattern does.
+    /// - An element with a Text pattern (a document, a rich editor) does when
+    ///   its text isn't read-only: Chromium reports the page itself as a
+    ///   read-only document when no field has focus.
+    /// - Anything else doesn't. A failed call is "unknown", never "no".
+    unsafe fn focused_field(
+        automation: &windows::Win32::UI::Accessibility::IUIAutomation,
+    ) -> FocusField {
+        use windows::core::HRESULT;
+        use windows::Win32::System::Variant::{VariantClear, VT_BOOL};
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationTextPattern, IUIAutomationValuePattern, UIA_EditControlTypeId,
+            UIA_IsReadOnlyAttributeId, UIA_TextPatternId, UIA_ValuePatternId,
+        };
+        let Ok(element) = automation.GetFocusedElement() else {
+            return FocusField::Unknown;
+        };
+        let Ok(control) = element.CurrentControlType() else {
+            return FocusField::Unknown;
+        };
+        // An unsupported pattern comes back as a null pointer (an error with
+        // S_OK); any other error means the call itself failed.
+        let unsupported = |e: &windows::core::Error| e.code() == HRESULT(0);
+        let value_read_only = match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+            Ok(value) => match value.CurrentIsReadOnly() {
+                Ok(read_only) => Some(read_only.as_bool()),
+                Err(_) => return FocusField::Unknown,
+            },
+            Err(e) if unsupported(&e) => None,
+            Err(_) => return FocusField::Unknown,
+        };
+        let text_read_only = || -> Result<Option<bool>, ()> {
+            match element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                Ok(text) => {
+                    let range = text.DocumentRange().map_err(|_| ())?;
+                    let mut value = range.GetAttributeValue(UIA_IsReadOnlyAttributeId).map_err(|_| ())?;
+                    let inner = &value.Anonymous.Anonymous;
+                    // Mixed or unsupported come back as an object, not a bool.
+                    let answer = (inner.vt == VT_BOOL).then(|| inner.Anonymous.boolVal.0 != 0);
+                    let _ = VariantClear(&mut value);
+                    answer.map(Some).ok_or(())
+                }
+                Err(e) if unsupported(&e) => Ok(None),
+                Err(_) => Err(()),
+            }
+        };
+        uia_field_kind(control == UIA_EditControlTypeId, value_read_only, text_read_only)
+    }
+
+    pub fn field_check(_snapshot: &TargetSnapshot, timeout: Duration) -> FocusField {
+        let (tx, rx) = mpsc::channel();
+        let deadline = Instant::now() + timeout;
+        let sent = worker()
+            .lock()
+            .map(|sender| sender.send(Request::Field(tx, deadline)).is_ok())
+            .unwrap_or(false);
+        if !sent {
+            return FocusField::Unknown;
+        }
+        rx.recv_timeout(timeout).unwrap_or(FocusField::Unknown)
+    }
+
     pub fn password_check(timeout: Duration) -> PasswordCheck {
         let (tx, rx) = mpsc::channel();
         let sent = worker()
             .lock()
-            .map(|sender| sender.send(tx).is_ok())
+            .map(|sender| sender.send(Request::Password(tx)).is_ok())
             .unwrap_or(false);
         if !sent {
             return PasswordCheck::Unavailable;
@@ -785,6 +994,96 @@ mod platform {
         snapshot
     }
 
+    /// VoiceFlow 0.9.23 (Finder only): the focused element through
+    /// Accessibility. A text field, text area, combo box or search field, or
+    /// a settable value, takes text; no focused element (the desktop with
+    /// nothing being renamed) or any other role doesn't. Without the
+    /// Accessibility permission, or on any other error: unknown.
+    pub fn field_check(snapshot: &TargetSnapshot, _timeout: Duration) -> FocusField {
+        use accessibility_sys::{
+            kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXFocusedUIElementAttribute,
+            kAXRoleAttribute,
+            kAXSubroleAttribute, kAXValueAttribute, AXIsProcessTrusted,
+            AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
+            AXUIElementIsAttributeSettable, AXUIElementRef, AXUIElementSetMessagingTimeout,
+        };
+        use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
+        use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
+
+        unsafe fn string_attr(element: AXUIElementRef, name: &str) -> Option<String> {
+            let attr = NSString::from_str(name);
+            let mut value: CFTypeRef = std::ptr::null();
+            let err = AXUIElementCopyAttributeValue(
+                element,
+                objc2::rc::Retained::as_ptr(&attr) as CFStringRef,
+                &mut value,
+            );
+            if err != 0 || value.is_null() {
+                return None;
+            }
+            let text = if CFGetTypeID(value) == CFStringGetTypeID() {
+                let s: &NSString = &*(value as *const NSString);
+                Some(s.to_string())
+            } else {
+                None
+            };
+            CFRelease(value);
+            text
+        }
+
+        let Some(pid) = snapshot.pid else {
+            return FocusField::Unknown;
+        };
+        unsafe {
+            if !AXIsProcessTrusted() {
+                return FocusField::Unknown;
+            }
+            let app = AXUIElementCreateApplication(pid as i32);
+            if app.is_null() {
+                return FocusField::Unknown;
+            }
+            AXUIElementSetMessagingTimeout(app, 0.05);
+            let focused_attr = NSString::from_str(kAXFocusedUIElementAttribute);
+            let mut focused: CFTypeRef = std::ptr::null();
+            let err = AXUIElementCopyAttributeValue(
+                app,
+                objc2::rc::Retained::as_ptr(&focused_attr) as CFStringRef,
+                &mut focused,
+            );
+            CFRelease(app as CFTypeRef);
+            if err == kAXErrorNoValue {
+                return FocusField::NotEditable;
+            }
+            if err != 0 || focused.is_null() {
+                return FocusField::Unknown;
+            }
+            let element = focused as AXUIElementRef;
+            // The app's timeout doesn't carry over to elements it returns.
+            AXUIElementSetMessagingTimeout(element, 0.05);
+            let role = string_attr(element, kAXRoleAttribute);
+            let subrole = string_attr(element, kAXSubroleAttribute);
+            let value_attr = NSString::from_str(kAXValueAttribute);
+            let mut settable = false;
+            let settable_err = AXUIElementIsAttributeSettable(
+                element,
+                objc2::rc::Retained::as_ptr(&value_attr) as CFStringRef,
+                &mut settable,
+            );
+            CFRelease(focused);
+            let Some(role) = role else {
+                return FocusField::Unknown;
+            };
+            // No AXValue at all is a real "no"; a failed or timed-out call
+            // couldn't tell.
+            let settable = match settable_err {
+                0 => Some(settable),
+                kAXErrorAttributeUnsupported | kAXErrorNoValue => Some(false),
+                _ => None,
+            };
+            ax_field_kind(&role, subrole.as_deref(), settable)
+        }
+    }
+
     pub fn password_check(_timeout: Duration) -> PasswordCheck {
         // Secure event input is on while a secure text field has focus.
         if unsafe { IsSecureEventInputEnabled() } != 0 {
@@ -823,6 +1122,10 @@ mod platform {
 
     pub fn password_check(_timeout: Duration) -> PasswordCheck {
         PasswordCheck::Unsupported
+    }
+
+    pub fn field_check(_snapshot: &TargetSnapshot, _timeout: Duration) -> FocusField {
+        FocusField::Unknown
     }
 
     pub fn focus(_window_id: Option<&str>, _pid: Option<u32>) -> bool {
@@ -1037,6 +1340,20 @@ mod tests {
         );
     }
 
+    /// Reads the field check on whatever app is in front right now and
+    /// prints the app's executable and the answer (never a title or text).
+    /// Read only. Run by hand with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_field_check() {
+        let snapshot = platform::identity();
+        let answer = platform::field_check(&snapshot, FIELD_CHECK_TIMEOUT);
+        println!(
+            "exe={:?} bundle={:?} class={:?} field={answer:?}",
+            snapshot.exe_name, snapshot.bundle_id, snapshot.window_class
+        );
+    }
+
     /// Times the paste-time re-check on the real foreground app (read only:
     /// no keystroke, no clipboard). Run by hand with `--ignored`.
     #[test]
@@ -1063,6 +1380,77 @@ mod tests {
             ms[29],
             verify_paste_binding(&b)
         );
+    }
+
+    #[test]
+    fn the_field_check_is_asked_for_any_identified_app_and_nowhere_only_in_file_managers() {
+        let mut explorer = seen(Some("1"), Some(1));
+        explorer.exe_name = Some("explorer.exe".into());
+        assert!(field_check_applies(&explorer));
+        assert!(is_file_manager(&explorer));
+        let mut excel = explorer.clone();
+        excel.exe_name = Some("excel.exe".into());
+        assert!(field_check_applies(&excel));
+        assert!(!is_file_manager(&excel));
+        let mut unresolved = explorer.clone();
+        unresolved.resolved = false;
+        assert!(!field_check_applies(&unresolved));
+        let mut me = explorer.clone();
+        me.is_self = true;
+        assert!(!field_check_applies(&me));
+        let mut finder = TargetSnapshot::unresolved("macos");
+        finder.resolved = true;
+        finder.bundle_id = Some("com.apple.finder".into());
+        assert!(is_file_manager(&finder));
+        // Nowhere: a file manager whose focus positively takes no text.
+        assert!(nowhere_to_paste(&explorer, FocusField::NotEditable));
+        assert!(nowhere_to_paste(&finder, FocusField::NotEditable));
+        assert!(!nowhere_to_paste(&explorer, FocusField::Unknown));
+        assert!(!nowhere_to_paste(&explorer, FocusField::Editable));
+        // An Excel cell isn't editable to UI Automation, but takes a paste.
+        assert!(!nowhere_to_paste(&excel, FocusField::NotEditable));
+        finder.bundle_id = Some("com.apple.TextEdit".into());
+        assert!(!is_file_manager(&finder));
+        assert_eq!(serde_json::to_string(&PasteRefusal::NoField).unwrap(), "\"no-field\"");
+    }
+
+    #[test]
+    fn windows_ui_automation_answers_map_to_editable_or_not() {
+        let never = || -> Result<Option<bool>, ()> { panic!("not asked") };
+        // An Edit control: editable unless it says read-only; with no Value
+        // pattern its text decides.
+        assert_eq!(uia_field_kind(true, Some(false), never), FocusField::Editable);
+        assert_eq!(uia_field_kind(true, None, || Ok(None)), FocusField::Editable);
+        assert_eq!(uia_field_kind(true, None, || Ok(Some(true))), FocusField::NotEditable);
+        assert_eq!(uia_field_kind(true, None, || Err(())), FocusField::Unknown);
+        assert_eq!(uia_field_kind(true, Some(true), never), FocusField::NotEditable);
+        // Any writable value.
+        assert_eq!(uia_field_kind(false, Some(false), never), FocusField::Editable);
+        // A document: its text decides (Chromium's page with no field: read-only).
+        assert_eq!(uia_field_kind(false, None, || Ok(Some(false))), FocusField::Editable);
+        assert_eq!(uia_field_kind(false, None, || Ok(Some(true))), FocusField::NotEditable);
+        assert_eq!(uia_field_kind(false, Some(true), || Ok(Some(true))), FocusField::NotEditable);
+        // No pattern at all: a list, a button, a cell.
+        assert_eq!(uia_field_kind(false, None, || Ok(None)), FocusField::NotEditable);
+        // A failed or mixed answer couldn't tell.
+        assert_eq!(uia_field_kind(false, None, || Err(())), FocusField::Unknown);
+    }
+
+    #[test]
+    fn mac_text_roles_take_text_and_others_do_not() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"] {
+            assert_eq!(ax_field_kind(role, None, Some(true)), FocusField::Editable, "{role}");
+            // Read-only, or couldn't tell.
+            assert_eq!(ax_field_kind(role, None, Some(false)), FocusField::NotEditable, "{role}");
+            assert_eq!(ax_field_kind(role, None, None), FocusField::Unknown, "{role}");
+        }
+        assert_eq!(ax_field_kind("AXTextField", Some("AXSearchField"), Some(true)), FocusField::Editable);
+        // A slider's value is settable, but it isn't a text field.
+        assert_eq!(ax_field_kind("AXSlider", None, Some(true)), FocusField::NotEditable);
+        for role in ["AXOutline", "AXList", "AXRow", "AXScrollArea", "AXGroup", "AXButton", "AXWebArea"] {
+            assert_eq!(ax_field_kind(role, None, Some(false)), FocusField::NotEditable, "{role}");
+        }
+        assert_eq!(serde_json::to_string(&FocusField::NotEditable).unwrap(), "\"not-editable\"");
     }
 
     #[test]

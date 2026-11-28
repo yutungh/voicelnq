@@ -118,6 +118,13 @@ export const commands = [
 		callback: () => rpc.commands.nudgeExpression.execute({ delta: -1 }),
 	},
 	{
+		// VoiceFlow 0.9.23.
+		id: 'pasteLastTranscription',
+		title: 'Paste last transcription',
+		on: ['Pressed'],
+		callback: () => rpc.commands.pasteLastTranscription.execute(undefined),
+	},
+	{
 		id: 'startFeedbackRecording',
 		title: 'Give feedback by voice',
 		on: ['Pressed'],

@@ -36,6 +36,7 @@ import {
 	RECORDING_MODES,
 } from '$lib/constants/audio';
 import { CommandOrAlt, CommandOrControl } from '$lib/constants/keyboard';
+import { IS_MACOS } from '$lib/constants/platform';
 import { migrateSoundSettings, SOUND_SETTINGS } from './sound-schema';
 import { FIX_MODEL_SETTING } from '$lib/feedback/fix-model';
 import { SUPPORTED_LANGUAGES } from '$lib/constants/languages';
@@ -99,6 +100,9 @@ export const Settings = type({
 	// only the tidied text is pasted; the transcript is not.
 	'transformation.writeToCursorOnSuccess': 'boolean = true',
 	'transformation.simulateEnterAfterOutput': 'boolean = false',
+	// VoiceFlow 0.9.23: after a paste, put back what was on the clipboard.
+	// Off: the pasted text stays on the clipboard (0.9.11 to 0.9.22).
+	'paste.keepClipboard': 'boolean = true',
 
 	/**
 	 * VoiceFlow privacy mode (spec §4.3, Tier C).
@@ -260,6 +264,7 @@ export const Settings = type({
 	'shortcuts.local.expressionUp': 'string | null = null',
 	'shortcuts.local.expressionDown': 'string | null = null',
 	'shortcuts.local.startFeedbackRecording': 'string | null = null',
+	'shortcuts.local.pasteLastTranscription': 'string | null = null',
 
 	// Global shortcuts (system-wide shortcuts)
 	'shortcuts.global.toggleManualRecording': type('string | null').default(
@@ -292,6 +297,13 @@ export const Settings = type({
 	),
 	// Unset by default: any always-on default would take a key from some app.
 	'shortcuts.global.startFeedbackRecording': 'string | null = null',
+	// VoiceFlow 0.9.23: paste the newest dictation again. Not Ctrl+Shift+V,
+	// which is "paste as plain text" in browsers, Obsidian, Slack and Windows
+	// Terminal. On macOS Control+Command+V: Shift+Command+V is "paste and
+	// match style" and Option+Command+V moves files in Finder.
+	'shortcuts.global.pasteLastTranscription': type('string | null').default(
+		IS_MACOS ? 'Control+Command+V' : 'Control+Alt+V',
+	),
 
 	// VoiceFlow A2: the floating recording bar.
 	'bar.show': 'boolean = true',

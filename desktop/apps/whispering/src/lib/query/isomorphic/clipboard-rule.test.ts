@@ -13,6 +13,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+	COPIED_INSTEAD,
 	decidePaste,
 	deliveryNotice,
 	deliveryResult,
@@ -62,6 +63,8 @@ const DECLINED: Array<[string, Parameters<typeof decidePaste>[0]]> = [
 	['VoiceFlow itself', { current: target({ isSelf: true }) }],
 	['the desktop', { current: target({ exeName: 'explorer.exe', windowClass: 'Progman' }) }],
 	['the taskbar', { current: target({ exeName: 'explorer.exe', windowClass: 'Shell_TrayWnd' }) }],
+	// 0.9.23: File Explorer with no text field focused.
+	['File Explorer with no text field', { current: target({ exeName: 'explorer.exe', windowClass: 'CabinetWClass', focusField: 'not-editable' }) }],
 	['a password manager', { current: target({ exeName: '1password.exe' }) }],
 	['a password field', { current: target({ passwordCheck: 'password' }) }],
 	['another window than at Stop', { current: target(), atStop: target({ windowId: '8', pid: 80 }) }],
@@ -79,7 +82,8 @@ describe('not pasted means copied (0.9.11 hard rule)', () => {
 			// write_text puts the text on the clipboard before anything else.
 			const result = deliveryResult(decision, { pasted: false, copied: true });
 			expect(result.result).toBe('copied');
-			expect(deliveryNotice(result).title).toBe('Copied. Press Ctrl+V to paste.');
+			// 0.9.23 wording.
+			expect(deliveryNotice(result).title).toBe(COPIED_INSTEAD);
 		});
 	}
 
@@ -92,7 +96,9 @@ describe('not pasted means copied (0.9.11 hard rule)', () => {
 		]) {
 			const result = deliveryResult(allowed, native);
 			expect(result.result).toBe('copied');
-			expect(deliveryNotice(result).title).toStartWith('Copied. Press Ctrl+V');
+			// The guard stopped it: the same words (0.9.23).
+			expect(deliveryNotice(result).title).toBe(COPIED_INSTEAD);
+			expect(deliveryNotice(result).description).toContain('Press Ctrl+V to paste.');
 		}
 	});
 
