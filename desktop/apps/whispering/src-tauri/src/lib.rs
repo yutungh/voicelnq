@@ -444,28 +444,30 @@ async fn write_text(
     // The window check and the keystroke run in one blocking step, nothing in
     // between, so the paste goes only to the window it was authorized for
     // (spec §4.3).
-    let (pressed, field) = tokio::task::spawn_blocking(move || -> (KeyOutcome, Option<context::FocusField>) {
+    let (pressed, field, still_ours) = tokio::task::spawn_blocking(move || -> (KeyOutcome, Option<context::FocusField>, bool) {
         let (verdict, _password, field) = context::verify_paste_binding(&binding);
         if let Err(reason) = verdict {
-            return (KeyOutcome::Refused(reason), field);
+            return (KeyOutcome::Refused(reason), field, true);
         }
         // 0.9.23: checked again right before the keys. A key pressed during
-        // the check would change what Ctrl+V does; a copy made during it
-        // would paste the wrong text.
+        // the check would change what Ctrl+V does.
         if modifiers_held() {
-            return (KeyOutcome::NotSent("A key was held down just before the paste.".into()), field);
+            return (KeyOutcome::NotSent("A key was held down just before the paste.".into()), field, true);
         }
-        if written.is_some() && clipboard_keep::sequence() != written {
-            return (KeyOutcome::NotSent("The clipboard changed just before the paste.".into()), field);
+        // Someone else wrote the clipboard since the text: still pasted (the
+        // paste comes first), but the clipboard is then never put back.
+        let still_ours = written.is_none() || clipboard_keep::sequence() == written;
+        if !still_ours {
+            log::warn!("[paste] the clipboard changed before the keys; it won't be put back");
         }
         let mut enigo = match Enigo::new(&Settings::default()) {
             Ok(enigo) => enigo,
-            Err(e) => return (KeyOutcome::NotSent(e.to_string()), field),
+            Err(e) => return (KeyOutcome::NotSent(e.to_string()), field, still_ours),
         };
-        (press_paste_keys(&mut enigo, shortcut), field)
+        (press_paste_keys(&mut enigo, shortcut), field, still_ours)
     })
     .await
-    .unwrap_or_else(|e| (KeyOutcome::NotSent(format!("Paste task failed: {e}")), None));
+    .unwrap_or_else(|e| (KeyOutcome::NotSent(format!("Paste task failed: {e}")), None, true));
 
     let keys_sent = matches!(pressed, KeyOutcome::Sent { .. });
     if keys_sent {
@@ -481,7 +483,8 @@ async fn write_text(
         // 0.9.23: put the clipboard back later, holding the lock until then.
         Some((saved, seq)) if keys_sent => {
             let transcript = text.clone();
-            let allowed = restore.is_some_and(|mode| clipboard_keep::restore_allowed(mode, field));
+            let allowed =
+                still_ours && restore.is_some_and(|mode| clipboard_keep::restore_allowed(mode, field));
             tauri::async_runtime::spawn(async move {
                 let _held = one_at_a_time;
                 put_clipboard_back(saved, seq, allowed, window_id, transcript).await;
