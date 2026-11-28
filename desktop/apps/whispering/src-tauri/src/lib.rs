@@ -29,6 +29,9 @@ use secrets::{secret_get, secret_set, secret_store_kind};
 pub mod context;
 use context::{capture_target, focus_target};
 
+// VoiceFlow 0.9.23: the person's clipboard comes back after a paste.
+pub mod clipboard_keep;
+
 // VoiceFlow: close to tray, the native tray menu, start hidden at login (plan v2, A1).
 pub mod lifecycle;
 pub mod tray;
@@ -322,19 +325,27 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 /// One delivery at a time: two dictations finishing together must not swap
 /// each other's clipboard text between the write and the keystroke.
-static PASTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// VoiceFlow 0.9.23: a delivery whose clipboard is put back keeps the lock
+/// until then, so the next one saves the person's clipboard, not this text.
+static PASTE_LOCK: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
 
 /** How long a delivery keeps the lock after the paste keys (the app reads the clipboard). */
 const PASTE_SETTLE_MS: u64 = 150;
 
 /// Puts the text on the clipboard and, with a `binding`, pastes it.
 ///
-/// VoiceFlow 0.9.11: the text stays on the clipboard afterwards, pasted or
-/// not, so a paste that went nowhere (a box that wasn't a text field, an app
-/// that ignored the keys) never loses the dictation; the person can press
-/// Ctrl+V. The previous clipboard is no longer put back: a delayed restore
-/// raced apps that read the clipboard late, and a failed restore turned a
-/// paste that worked into "Couldn't paste".
+/// VoiceFlow 0.9.11: when nothing is pasted (a refusal, keys that couldn't
+/// be sent), the text stays on the clipboard so the person can press Ctrl+V.
+///
+/// VoiceFlow 0.9.23, `keep_clipboard` (Settings: Keep my clipboard after
+/// pasting): the clipboard is saved first (`clipboard_keep`), the text goes
+/// on it marked as transient, and after the paste the saved clipboard is put
+/// back in the background, once the app has had time to read the text and
+/// only if nothing else wrote the clipboard since. This never changes the
+/// result: a restore that can't happen leaves the text on the clipboard.
+/// Without `keep_clipboard`, or when the clipboard can't be saved
+/// faithfully, the text stays on the clipboard after a paste, as in 0.9.11.
 ///
 /// With a `binding` (the window the paste was authorized for), the app in
 /// front and its focused field are checked again right before the keystroke;
@@ -349,12 +360,44 @@ async fn write_text(
     text: String,
     binding: Option<context::PasteBinding>,
     shortcut: Option<PasteShortcut>,
+    keep_clipboard: Option<bool>,
 ) -> Result<PasteResult, String> {
-    let _one_at_a_time = PASTE_LOCK.lock().await;
+    let one_at_a_time = PASTE_LOCK.clone().lock_owned().await;
 
-    if let Err(e) = app.clipboard().write_text(&text) {
-        log::warn!("[paste] could not write the clipboard: {e}");
-        return Ok(PasteResult::failed(false, format!("Couldn't use the clipboard: {e}")));
+    // 0.9.23: save the clipboard, and write the text marked as transient,
+    // only when a paste will be tried and the clipboard can be put back.
+    let mut kept: Option<(clipboard_keep::Saved, Option<u64>)> = None;
+    if keep_clipboard == Some(true) && binding.is_some() {
+        let transcript = text.clone();
+        kept = tokio::task::spawn_blocking(move || {
+            match clipboard_keep::snapshot() {
+                clipboard_keep::Snapshot::Saved(saved) => {
+                    match clipboard_keep::write_transient(&transcript) {
+                        Ok(seq) => {
+                            log::info!("[paste] clipboard saved ({} formats, {} bytes)", saved.formats, saved.bytes);
+                            Some((saved, seq))
+                        }
+                        Err(e) => {
+                            log::warn!("[paste] transient write failed ({e}); writing as before");
+                            None
+                        }
+                    }
+                }
+                other => {
+                    log::info!("[paste] clipboard {}; the text will stay on it", other.describe());
+                    None
+                }
+            }
+        })
+        .await
+        .unwrap_or(None);
+    }
+
+    if kept.is_none() {
+        if let Err(e) = app.clipboard().write_text(&text) {
+            log::warn!("[paste] could not write the clipboard: {e}");
+            return Ok(PasteResult::failed(false, format!("Couldn't use the clipboard: {e}")));
+        }
     }
 
     // No fixed wait on Windows and macOS. arboard sets the text synchronously
@@ -370,6 +413,7 @@ async fn write_text(
         return Ok(PasteResult::copied(None));
     };
     let shortcut = shortcut.unwrap_or_default();
+    let window_id = binding.window_id.clone();
 
     // The window check and the keystroke run in one blocking step, nothing in
     // between, so the paste goes only to the window it was authorized for
@@ -388,10 +432,32 @@ async fn write_text(
     .await
     .unwrap_or_else(|e| KeyOutcome::NotSent(format!("Paste task failed: {e}")));
 
-    if matches!(pressed, KeyOutcome::Sent { .. }) {
+    let keys_sent = matches!(pressed, KeyOutcome::Sent { .. });
+    if keys_sent {
         // Hold the lock a moment so the app reads this text before another
         // delivery can put its own on the clipboard (Codex review).
         tokio::time::sleep(tokio::time::Duration::from_millis(PASTE_SETTLE_MS)).await;
+    }
+
+    match kept {
+        // 0.9.23: put the clipboard back later, holding the lock until then.
+        Some((saved, seq)) if keys_sent => {
+            let transcript = text.clone();
+            tauri::async_runtime::spawn(async move {
+                let _held = one_at_a_time;
+                put_clipboard_back(saved, seq, window_id, transcript).await;
+            });
+        }
+        // Nothing was pasted: the text stays, as an ordinary clipboard entry.
+        Some((_, seq)) => {
+            let transcript = text.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                clipboard_keep::keep_transcript(&transcript, seq)
+            })
+            .await;
+            log::info!("[paste] not pasted; the text stays on the clipboard: {outcome:?}");
+        }
+        None => {}
     }
 
     Ok(match pressed {
@@ -399,7 +465,7 @@ async fn write_text(
             if let Some(warning) = &warning {
                 log::warn!("[paste] keys sent, but {warning}");
             }
-            log::info!("[paste] pasted ({shortcut:?}); the text stays on the clipboard");
+            log::info!("[paste] pasted ({shortcut:?})");
             PasteResult::pasted()
         }
         KeyOutcome::Refused(reason) => PasteResult::copied(Some(reason)),
@@ -408,6 +474,38 @@ async fn write_text(
             PasteResult::failed(true, error)
         }
     })
+}
+
+/// VoiceFlow 0.9.23: after a paste, waits for the app to answer and for
+/// `RESTORE_DELAY`, then puts the saved clipboard back (or, when that isn't
+/// safe, leaves the text as an ordinary clipboard entry). Logs what happened,
+/// never the contents.
+async fn put_clipboard_back(
+    saved: clipboard_keep::Saved,
+    seq: Option<u64>,
+    window_id: Option<String>,
+    transcript: String,
+) {
+    let waited = tokio::time::Duration::from_millis(PASTE_SETTLE_MS);
+    let answered = tokio::task::spawn_blocking(move || clipboard_keep::target_answers(window_id.as_deref()))
+        .await
+        .unwrap_or(false);
+    tokio::time::sleep(clipboard_keep::RESTORE_DELAY.saturating_sub(waited)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        match clipboard_keep::after_paste(true, seq, answered) {
+            clipboard_keep::AfterPaste::Restore => {
+                let seq = seq.expect("after_paste restores only with a sequence");
+                format!("put back: {:?}", clipboard_keep::restore(saved, seq, &transcript))
+            }
+            clipboard_keep::AfterPaste::KeepTranscript(why) => format!(
+                "not put back ({why}); the text stays: {:?}",
+                clipboard_keep::keep_transcript(&transcript, seq)
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| format!("restore task failed: {e}"));
+    log::info!("[paste] clipboard {outcome}");
 }
 
 /// Which keys paste. Most apps take Ctrl+V; mintty (Git Bash) pastes with

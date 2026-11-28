@@ -375,12 +375,14 @@ describe('Outcome and notice match what happened', () => {
 		expect(deliveryNotice(r).title).toBe('Pasted into Kite');
 	});
 
-	test('nowhere to paste: copied, "Copied. Press Ctrl+V to paste."', () => {
+	test(`nowhere to paste: copied, "Couldn't paste — transcription copied to clipboard."`, () => {
 		const r = deliveryResult(desktop, { pasted: false, copied: true });
 		expect(r.result).toBe('copied');
 		const notice = deliveryNotice(r);
-		expect(notice.title).toBe('Copied. Press Ctrl+V to paste.');
-		expect(notice.description).toBe('The desktop was in front. It is also in History.');
+		expect(notice.title).toBe("Couldn't paste — transcription copied to clipboard.");
+		expect(notice.description).toBe(
+			'The desktop was in front. Press Ctrl+V to paste. It is also in History.',
+		);
 		expect(notice.title).not.toContain('Not pasted');
 	});
 
@@ -422,7 +424,7 @@ describe('Outcome and notice match what happened', () => {
 
 	test('every copy reason has words, and pasted reasons have none', () => {
 		const reasons: PasteDecision['reason'][] = [
-			'unresolved', 'self', 'shell', 'blocked-app', 'password-field', 'moved', 'elevated',
+			'unresolved', 'self', 'shell', 'blocked-app', 'password-field', 'no-field', 'moved', 'elevated',
 			'elevation-unknown', 'target-gone', 'sent-anyway', 'target-changed', 'keys-failed',
 		];
 		for (const reason of reasons) {
@@ -433,9 +435,9 @@ describe('Outcome and notice match what happened', () => {
 
 	test('macOS says Cmd+V', () => {
 		const mac = decidePaste({ current: target({ platform: 'macos', isSelf: true }) });
-		expect(deliveryNotice(deliveryResult(mac, { pasted: false, copied: true })).title).toBe(
-			'Copied. Press Cmd+V to paste.',
-		);
+		const notice = deliveryNotice(deliveryResult(mac, { pasted: false, copied: true }));
+		expect(notice.title).toBe("Couldn't paste — transcription copied to clipboard.");
+		expect(notice.description).toContain('Press Cmd+V to paste.');
 	});
 });
 

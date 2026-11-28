@@ -37,7 +37,9 @@ export async function authorizePaste(
 	const target = context?.target ?? null;
 	const sendingAnyway =
 		context?.privacy === 'sent-anyway' || context?.privacy === 'held';
-	let current = await captureTarget();
+	// 0.9.23: with the field check, so File Explorer or Finder with no text
+	// field focused counts as nowhere to paste.
+	let current = await captureTarget({ checkField: true });
 	let targetGone = false;
 	if (
 		context?.restoreFocus &&
@@ -48,7 +50,7 @@ export async function authorizePaste(
 		!target.isSelf
 	) {
 		targetGone = !(await focusTarget(target));
-		if (!targetGone) current = await captureTarget();
+		if (!targetGone) current = await captureTarget({ checkField: true });
 	}
 	return decidePaste({
 		current,

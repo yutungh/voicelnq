@@ -99,6 +99,9 @@ export const Settings = type({
 	// only the tidied text is pasted; the transcript is not.
 	'transformation.writeToCursorOnSuccess': 'boolean = true',
 	'transformation.simulateEnterAfterOutput': 'boolean = false',
+	// VoiceFlow 0.9.23: after a paste, put back what was on the clipboard.
+	// Off: the pasted text stays on the clipboard (0.9.11 to 0.9.22).
+	'paste.keepClipboard': 'boolean = true',
 
 	/**
 	 * VoiceFlow privacy mode (spec §4.3, Tier C).

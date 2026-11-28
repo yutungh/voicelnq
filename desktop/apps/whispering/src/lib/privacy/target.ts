@@ -37,14 +37,20 @@ export function unresolvedTarget(error: string): TargetSnapshot {
  */
 export async function captureTarget({
 	checkPassword = true,
+	checkField = false,
 }: {
 	/** False at Stop: identity only, quick (0.9.11). */
 	checkPassword?: boolean;
+	/**
+	 * VoiceFlow 0.9.23: at paste time, also ask whether the focused element
+	 * takes text (File Explorer and Finder only; elsewhere it isn't asked).
+	 */
+	checkField?: boolean;
 } = {}): Promise<TargetSnapshot> {
 	if (!window.__TAURI_INTERNALS__) return WEB_SNAPSHOT;
 	try {
 		const { invoke } = await import('@tauri-apps/api/core');
-		return await invoke<TargetSnapshot>('capture_target', { checkPassword });
+		return await invoke<TargetSnapshot>('capture_target', { checkPassword, checkField });
 	} catch (error) {
 		return unresolvedTarget(`capture failed: ${String(error)}`);
 	}

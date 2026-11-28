@@ -473,7 +473,9 @@
 
 			<section class="card sp" id="pasting" aria-labelledby="h-paste">
 				<div class="c-h"><Tile icon="cursor-text" /><h2 id="h-paste">Pasting</h2></div>
-				{@render toggle('Paste into the app', 'Where your cursor is when the words are ready. Whenever they are not pasted, they are copied. Either way they stay on the clipboard.', settings.value['transformation.writeToCursorOnSuccess'], (v) => settings.update({ 'transformation.writeToCursorOnSuccess': v, 'transcription.writeToCursorOnSuccess': v }))}
+				{@render toggle('Paste into the app', 'Where your cursor is when the words are ready. When there is nowhere to paste, they are copied to the clipboard instead.', settings.value['transformation.writeToCursorOnSuccess'], (v) => settings.update({ 'transformation.writeToCursorOnSuccess': v, 'transcription.writeToCursorOnSuccess': v }))}
+				<!-- VoiceFlow 0.9.23: put the clipboard back after a paste. -->
+				{@render toggle('Keep my clipboard after pasting', 'What you had copied comes back once your words are pasted. Turn off to leave your words on the clipboard.', settings.value['paste.keepClipboard'], (v) => settings.updateKey('paste.keepClipboard', v))}
 				{@render toggle('Press Enter after pasting', 'Sends chat messages straight away', settings.value['transformation.simulateEnterAfterOutput'], (v) => settings.update({ 'transformation.simulateEnterAfterOutput': v, 'transcription.simulateEnterAfterOutput': v }))}
 			</section>
 

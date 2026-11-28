@@ -2,6 +2,7 @@ import { Ok } from 'wellcrafted/result';
 import { defineMutation } from '$lib/query/client';
 import { settings } from '$lib/stores/settings.svelte';
 import {
+	COPIED_INSTEAD,
 	deliveryNotice,
 	deliveryResult,
 	copiedWhy,
@@ -22,9 +23,10 @@ import { driftReasonText } from '$lib/vf/drift-check';
 /**
  * VoiceFlow C1 (design B3.1 "Notices"), 0.9.11: delivery tells the person
  * only what happened. A paste is confirmed quietly ("Pasted into Telegram");
- * when there was nowhere to paste, the text is copied ("Copied. Press Ctrl+V
- * to paste.", which hides itself); "Not pasted" is left for a real failure
- * where the text is not on the clipboard either. The result is kept on the
+ * when there was nowhere to paste, the text is copied (0.9.23: "Couldn't
+ * paste — transcription copied to clipboard.", which hides itself); "Not
+ * pasted" is left for a real failure where the text is not on the clipboard
+ * either. The result is kept on the
  * dictation so Home and History show it too.
  */
 
@@ -58,8 +60,9 @@ function messageOf(error: object): string {
 
 /**
  * Pastes or copies the text (0.9.11), as `decidePaste` says for the window
- * in front now, and reports what actually happened. The text ends on the
- * clipboard in both cases.
+ * in front now, and reports what actually happened. Not pasted: the text is
+ * on the clipboard. Pasted: since 0.9.23 the previous clipboard is put back
+ * (Keep my clipboard after pasting), else the text stays there.
  */
 export async function placeText(
 	text: string,
@@ -72,6 +75,10 @@ export async function placeText(
 		text,
 		binding: decision.paste ? decision.binding : undefined,
 		shortcut: decision.paste ? decision.shortcut : undefined,
+		// 0.9.23: put the person's own clipboard back after a paste.
+		// Not for a remote desktop or VM, which reads the clipboard late.
+		keepClipboard:
+			decision.paste && decision.restoresClipboard !== false && settings.value['paste.keepClipboard'],
 	});
 	let native: NativePasteResult | null = error ? null : data;
 	const failure = error ? messageOf(error) : (data?.error ?? null);
@@ -185,7 +192,8 @@ export async function reportDelivered({
 		rpc.notify.info.execute({
 			id: toastId,
 			title: 'Kept your words',
-			description: `${keptWordsDetail(keptWords)} Use cleaned copies the tidied text; History keeps it too.`,
+			// 0.9.23: a copy instead of a paste says so here too.
+			description: `${delivered.result === 'copied' ? `${COPIED_INSTEAD} ` : ''}${keptWordsDetail(keptWords)} Use cleaned copies the tidied text; History keeps it too.`,
 			action: {
 				type: 'button',
 				label: 'Use cleaned',
@@ -254,7 +262,7 @@ async function deliver(
 
 	if (settings.value[`${kind}.writeToCursorOnSuccess`]) {
 		// 0.9.11: paste where the cursor is, or copy when there is nowhere to
-		// paste; either way the text ends on the clipboard.
+		// paste. 0.9.23: after a paste the previous clipboard comes back.
 		const delivered = await placeText(text, paste, traceId);
 		if (delivered.result === 'pasted' && settings.value[`${kind}.simulateEnterAfterOutput`]) {
 			const { error: enterError } = await rpc.text.simulateEnterKeystroke.execute();

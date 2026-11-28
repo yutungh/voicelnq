@@ -76,7 +76,20 @@ export type TargetSnapshot = {
 	 * couldn't be read. Absent in snapshots rebuilt from History.
 	 */
 	higherIntegrity?: boolean | null;
+	/**
+	 * VoiceFlow 0.9.23: whether the focused element takes text, read at paste
+	 * time only where that answer is trusted (File Explorer and Finder, which
+	 * also owns the macOS desktop). null or absent: not checked.
+	 */
+	focusField?: FocusField | null;
 };
+
+/**
+ * VoiceFlow 0.9.23: the focused element at paste time. `not-editable` is a
+ * positive answer (a file list, a breadcrumb); `unknown` means the check
+ * couldn't tell and never stops a paste.
+ */
+export type FocusField = 'editable' | 'not-editable' | 'unknown';
 
 export type RecordDecision = {
 	/** allow: record and upload. refuse: don't record. */
@@ -258,6 +271,8 @@ export type PasteReason =
 	| 'shell'
 	| 'blocked-app'
 	| 'password-field'
+	/** 0.9.23: File Explorer or Finder with no text field focused. */
+	| 'no-field'
 	| 'moved'
 	| 'elevated'
 	| 'elevation-unknown'
@@ -279,6 +294,11 @@ export type PasteDecision = {
 	 */
 	binding?: PasteBinding;
 	shortcut?: PasteShortcut;
+	/**
+	 * 0.9.23, set when the paste is allowed: false for a remote desktop or
+	 * virtual machine, whose paste keeps the text on the clipboard.
+	 */
+	restoresClipboard?: boolean;
 	/** "Ctrl+V" or "Cmd+V", for the notice. */
 	keys: string;
 };
@@ -306,17 +326,20 @@ export function sameWindow(
 /**
  * Where the text goes when it is ready (0.9.11). Pure, so every rule is unit
  * tested. Not pasting always means copying: the text goes on the clipboard
- * with "Copied. Press Ctrl+V to paste." and stays in History.
+ * (0.9.23: "Couldn't paste — transcription copied to clipboard.") and stays
+ * in History.
  *
  * - Copy: nothing readable in front; VoiceFlow itself; the desktop, taskbar,
- *   Start menu or window switcher; a blocked app; a password field; another
+ *   Start menu or window switcher; File Explorer or Finder with no text
+ *   field focused (0.9.23); a blocked app; a password field; another
  *   window than the one in front at Stop; an app running as administrator
  *   (Windows drops VoiceFlow's keys there) or one whose level can't be read;
  *   a button-started paste whose window is closed; a dictation sent with
  *   Send anyway (0.9.10 and earlier).
  * - Paste: any other app window, even when the field check can't answer
- *   (Electron apps, terminals). The text stays on the clipboard afterwards,
- *   so a paste that lands nowhere loses nothing.
+ *   (Electron apps, terminals). Since 0.9.23 the person's own clipboard is
+ *   put back after a paste (Settings: Keep my clipboard after pasting); the
+ *   text is always in History, so a paste that lands nowhere loses nothing.
  */
 export function decidePaste({
 	current,
@@ -348,11 +371,15 @@ export function decidePaste({
 	// Send anyway never auto-pastes (spec §4.3, test 9).
 	if (privacy === 'sent-anyway' || privacy === 'held') return copy('sent-anyway');
 	const surface = shellSurface(current);
-	if (surface) return copy('shell', { surface });
+	// 0.9.23: renaming an icon on the desktop is a text field.
+	const renaming = surface === 'desktop' && current.focusField === 'editable';
+	if (surface && !renaming) return copy('shell', { surface });
 	if (!current.resolved) return copy('unresolved');
 	if (current.isSelf) return copy('self');
 	if (findBlockedApp(current)) return copy('blocked-app');
 	if (current.passwordCheck === 'password') return copy('password-field');
+	// 0.9.23: only a positive "no text field" counts; unknown pastes.
+	if (current.focusField === 'not-editable') return copy('no-field');
 	if (atStop && !sameWindow(atStop, current)) return copy('moved');
 	if (current.higherIntegrity === true) return copy('elevated');
 	if (current.platform === 'windows' && current.higherIntegrity === null) {
@@ -366,7 +393,63 @@ export function decidePaste({
 		keys,
 		binding: { windowId: current.windowId, pid: current.pid },
 		shortcut: pasteShortcutFor(current),
+		restoresClipboard: !readsClipboardLate(current),
 	};
+}
+
+/**
+ * VoiceFlow 0.9.23: remote-desktop and virtual-machine windows send the
+ * clipboard to the other computer when it asks for it, which can be long
+ * after the keystroke. Putting the clipboard back there could paste the old
+ * one, so their paste leaves the text on the clipboard (as before 0.9.23).
+ * A remote session inside a browser tab can't be told apart; it gets the
+ * restore like any page.
+ */
+const LATE_READER_EXES: ReadonlySet<string> = new Set([
+	'mstsc.exe',
+	'msrdc.exe',
+	'msrdcw.exe',
+	'windowsapp.exe',
+	'vmconnect.exe',
+	'wfica32.exe',
+	'cdviewer.exe',
+	'vmware.exe',
+	'vmware-vmx.exe',
+	'vmware-remotemks.exe',
+	'virtualboxvm.exe',
+	'anydesk.exe',
+	'teamviewer.exe',
+	'parsecd.exe',
+	'rustdesk.exe',
+	'vncviewer.exe',
+	'tvnviewer.exe',
+	'remoting_desktop.exe',
+	'nxplayer.bin',
+]);
+
+const LATE_READER_BUNDLES: ReadonlySet<string> = new Set([
+	'com.microsoft.rdc.macos',
+	'com.microsoft.rdc.osx.beta',
+	'com.microsoft.windowsapp',
+	'com.citrix.receiver.icaviewer.mac',
+	'com.vmware.fusion',
+	'com.parallels.desktop.console',
+	'org.virtualbox.app.virtualboxvm',
+	'com.utmapp.utm',
+	'com.philandro.anydesk',
+	'com.teamviewer.teamviewer',
+	'tv.parsec.www',
+	'com.realvnc.vncviewer',
+	'com.apple.screensharing',
+	'com.carriez.rustdesk',
+]);
+
+export function readsClipboardLate(
+	target: Pick<TargetSnapshot, 'exeName' | 'bundleId'>,
+): boolean {
+	const exe = target.exeName?.toLowerCase();
+	const bundle = target.bundleId?.toLowerCase();
+	return (!!exe && LATE_READER_EXES.has(exe)) || (!!bundle && LATE_READER_BUNDLES.has(bundle));
 }
 
 /** What `write_text` reports (Rust `PasteResult`): facts, not a verdict. */
@@ -440,6 +523,11 @@ export function copiedWhy(decision: PasteDecision): string | null {
 			return `${app} is on the block list.`;
 		case 'password-field':
 			return `${app} looks like a password field.`;
+		case 'no-field': {
+			// explorer.exe reads as "explorer"; people know it as File Explorer.
+			const where = decision.appName?.toLowerCase() === 'explorer' ? 'File Explorer' : decision.appName;
+			return `No text field was selected in ${where ?? 'that window'}.`;
+		}
 		case 'moved':
 			return 'Another window was in front than when you pressed Stop.';
 		case 'elevated':
@@ -457,6 +545,12 @@ export function copiedWhy(decision: PasteDecision): string | null {
 	}
 }
 
+/**
+ * VoiceFlow 0.9.23: the notice whenever a paste was meant to happen and the
+ * text was copied instead (nowhere to paste, or the guard stopped it).
+ */
+export const COPIED_INSTEAD = "Couldn't paste — transcription copied to clipboard.";
+
 /** What the person is told, by delivery result. */
 export function deliveryNotice(delivered: DeliveryResult): {
 	title: string;
@@ -471,8 +565,8 @@ export function deliveryNotice(delivered: DeliveryResult): {
 			};
 		case 'copied':
 			return {
-				title: `Copied. Press ${decision.keys} to paste.`,
-				description: [copiedWhy(decision), 'It is also in History.']
+				title: COPIED_INSTEAD,
+				description: [copiedWhy(decision), `Press ${decision.keys} to paste. It is also in History.`]
 					.filter(Boolean)
 					.join(' '),
 			};

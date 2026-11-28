@@ -29,9 +29,11 @@ export type TextService = {
 	 * Puts the text on the clipboard and, with a binding, pastes it at the
 	 * cursor (Cmd+V on macOS, Ctrl+V elsewhere, Shift+Insert for mintty).
 	 *
-	 * VoiceFlow 0.9.11: the text stays on the clipboard afterwards, pasted or
-	 * not; the previous clipboard is not put back. Without a binding it is
-	 * only copied.
+	 * VoiceFlow 0.9.23: with `keepClipboard`, a paste puts the person's own
+	 * clipboard back once the app has read the text (best effort: when it
+	 * can't be put back, the text stays). Without it, or when nothing is
+	 * pasted, the text stays on the clipboard. Without a binding it is only
+	 * copied.
 	 *
 	 * @param text The text to write at the cursor position.
 	 */
@@ -44,6 +46,8 @@ export type TextService = {
 		 */
 		binding?: PasteBinding,
 		shortcut?: PasteShortcut,
+		/** VoiceFlow 0.9.23: put the previous clipboard back after a paste. */
+		keepClipboard?: boolean,
 	) => MaybePromise<Result<PasteOutcome, TextServiceError | WhisperingError>>;
 
 	/**

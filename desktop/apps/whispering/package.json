@@ -1,7 +1,7 @@
 {
 	"name": "@voiceflow/desktop",
 	"private": true,
-	"version": "0.9.22",
+	"version": "0.9.23",
 	"description": "",
 	"exports": {
 		"./commands": "./src/lib/commands.ts"
