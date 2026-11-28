@@ -52,6 +52,8 @@
 		{ id: 'cancelManualRecording', label: 'Cancel dictation', help: 'Stops without sending anything' },
 		{ id: 'openTransformationPicker', label: 'Pick a style for one dictation', help: 'While dictating: next style on the bar' },
 		{ id: 'runTransformationOnClipboard', label: 'Tidy up the clipboard', help: 'Uses your default style' },
+		// VoiceFlow 0.9.23.
+		{ id: 'pasteLastTranscription', label: 'Paste last transcription', help: 'Pastes your latest dictation where your cursor is' },
 		// VoiceFlow A2: the recording bar's keys.
 		{ id: 'expressionUp', label: 'More expressive', help: 'While dictating; for this dictation only' },
 		{ id: 'expressionDown', label: 'Less expressive', help: 'While dictating; for this dictation only' },
@@ -475,7 +477,7 @@
 				<div class="c-h"><Tile icon="cursor-text" /><h2 id="h-paste">Pasting</h2></div>
 				{@render toggle('Paste into the app', 'Where your cursor is when the words are ready. When there is nowhere to paste, they are copied to the clipboard instead.', settings.value['transformation.writeToCursorOnSuccess'], (v) => settings.update({ 'transformation.writeToCursorOnSuccess': v, 'transcription.writeToCursorOnSuccess': v }))}
 				<!-- VoiceFlow 0.9.23: put the clipboard back after a paste. -->
-				{@render toggle('Keep my clipboard after pasting', 'What you had copied comes back once your words are pasted. Turn off to leave your words on the clipboard.', settings.value['paste.keepClipboard'], (v) => settings.updateKey('paste.keepClipboard', v))}
+				{@render toggle('Keep my clipboard after pasting', 'When your words are pasted into a text field, what you had copied comes back. When VoiceLnq is not sure the paste landed, your words stay on the clipboard.', settings.value['paste.keepClipboard'], (v) => settings.updateKey('paste.keepClipboard', v))}
 				{@render toggle('Press Enter after pasting', 'Sends chat messages straight away', settings.value['transformation.simulateEnterAfterOutput'], (v) => settings.update({ 'transformation.simulateEnterAfterOutput': v, 'transcription.simulateEnterAfterOutput': v }))}
 			</section>
 

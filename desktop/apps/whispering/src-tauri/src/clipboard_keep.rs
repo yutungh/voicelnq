@@ -72,6 +72,29 @@ impl Snapshot {
     }
 }
 
+/// VoiceFlow 0.9.23: when a paste's clipboard may be put back, as the
+/// paste rule (`decidePaste`) decided. No mode at all is an unsure paste:
+/// the text stays on the clipboard so a paste that silently failed can still
+/// be pasted by hand.
+#[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreWhen {
+    /// The field check said "editable": put back only if the guard's own
+    /// field check, right before the keystroke, still says so.
+    IfEditable,
+    /// A known terminal, or "Paste last transcription": always put back.
+    Always,
+}
+
+/// Pure: may this paste's clipboard be put back, given the guard's field
+/// answer right before the keystroke?
+pub fn restore_allowed(mode: RestoreWhen, field_at_keystroke: Option<crate::context::FocusField>) -> bool {
+    match mode {
+        RestoreWhen::Always => true,
+        RestoreWhen::IfEditable => field_at_keystroke == Some(crate::context::FocusField::Editable),
+    }
+}
+
 /// What happens to a saved clipboard after the paste attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AfterPaste {
@@ -83,9 +106,17 @@ pub enum AfterPaste {
 }
 
 /// Pure: after the paste attempt, is the saved clipboard put back?
-pub fn after_paste(keys_sent: bool, seq_after_write: Option<u64>, target_answered: bool) -> AfterPaste {
+pub fn after_paste(
+    keys_sent: bool,
+    allowed: bool,
+    seq_after_write: Option<u64>,
+    target_answered: bool,
+) -> AfterPaste {
     if !keys_sent {
         return AfterPaste::KeepTranscript("nothing was pasted");
+    }
+    if !allowed {
+        return AfterPaste::KeepTranscript("the field was no longer sure to take text");
     }
     if seq_after_write.is_none() {
         return AfterPaste::KeepTranscript("the clipboard's sequence number couldn't be read");
@@ -138,6 +169,11 @@ pub fn write_transient(text: &str) -> Result<Option<u64>, String> {
     platform::write_text(text, true)
 }
 
+/// The clipboard's sequence number (Windows) or change count (macOS) now.
+pub fn sequence() -> Option<u64> {
+    platform::sequence()
+}
+
 /// Rewrites the transcript as an ordinary clipboard entry, only if the
 /// clipboard still holds what we wrote.
 pub fn keep_transcript(text: &str, seq_after_write: Option<u64>) -> Restored {
@@ -146,8 +182,8 @@ pub fn keep_transcript(text: &str, seq_after_write: Option<u64>) -> Restored {
 
 /// Puts the saved clipboard back, only if the clipboard is still at
 /// `seq_after_write`. `transcript` goes back if no content could be written.
-pub fn restore(saved: Saved, seq_after_write: u64, transcript: &str) -> Restored {
-    platform::restore(saved.contents, seq_after_write, transcript)
+pub fn restore(saved: &Saved, seq_after_write: u64, transcript: &str) -> Restored {
+    platform::restore(&saved.contents, seq_after_write, transcript)
 }
 
 /// Windows: waits until the window pasted into handles messages again
@@ -340,26 +376,34 @@ mod platform {
         (n != 0).then_some(n as u64)
     }
 
-    unsafe fn read_global(handle: HANDLE) -> Option<Vec<u8>> {
+    /// Copies a global memory block, if it fits in `room` bytes (checked
+    /// before copying). None: it can't be locked. Some(None): too large.
+    unsafe fn read_global(handle: HANDLE, room: usize) -> Option<Option<Vec<u8>>> {
+        let size = GlobalSize(handle);
+        if size > room {
+            return Some(None);
+        }
         let ptr = GlobalLock(handle) as *const u8;
         if ptr.is_null() {
             return None;
         }
-        let size = GlobalSize(handle);
         let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
         GlobalUnlock(handle);
-        Some(bytes)
+        Some(Some(bytes))
     }
 
-    unsafe fn read_emf(handle: HANDLE) -> Option<Vec<u8>> {
+    unsafe fn read_emf(handle: HANDLE, room: usize) -> Option<Option<Vec<u8>>> {
         let emf = handle as HENHMETAFILE;
         let size = GetEnhMetaFileBits(emf, 0, std::ptr::null_mut());
         if size == 0 {
             return None;
         }
+        if size as usize > room {
+            return Some(None);
+        }
         let mut bytes = vec![0u8; size as usize];
         let read = GetEnhMetaFileBits(emf, size, bytes.as_mut_ptr());
-        (read == size).then_some(bytes)
+        (read == size).then_some(Some(bytes))
     }
 
     pub fn snapshot(budget: Duration, max_bytes: usize) -> Snapshot {
@@ -391,7 +435,8 @@ mod platform {
             if name.as_deref() == Some("CanIncludeInClipboardHistory") {
                 let handle = unsafe { GetClipboardData(*format) };
                 let value = (!handle.is_null())
-                    .then(|| unsafe { read_global(handle) })
+                    .then(|| unsafe { read_global(handle, 64) })
+                    .flatten()
                     .flatten()
                     .and_then(|b| b.get(..4).map(|d| u32::from_ne_bytes([d[0], d[1], d[2], d[3]])));
                 if history_flag_is_private(value, restored) {
@@ -418,16 +463,18 @@ mod platform {
                 WinFormat::Private | WinFormat::Unrestorable => unreachable!("checked above"),
                 WinFormat::Emf => {
                     let handle = unsafe { GetClipboardData(*format) };
-                    match (!handle.is_null()).then(|| unsafe { read_emf(handle) }).flatten() {
-                        Some(b) => Payload::Emf(b),
+                    match (!handle.is_null()).then(|| unsafe { read_emf(handle, max_bytes - bytes) }).flatten() {
+                        Some(Some(b)) => Payload::Emf(b),
+                        Some(None) => return Snapshot::Unrestorable("it is too large".into()),
                         None => return Snapshot::Unrestorable("a picture couldn't be read".into()),
                     }
                 }
                 WinFormat::Content | WinFormat::Bookkeeping => {
                     // Asks the owner to render a delayed format, if it is one.
                     let handle = unsafe { GetClipboardData(*format) };
-                    match (!handle.is_null()).then(|| unsafe { read_global(handle) }).flatten() {
-                        Some(b) => Payload::Global(b),
+                    match (!handle.is_null()).then(|| unsafe { read_global(handle, max_bytes - bytes) }).flatten() {
+                        Some(Some(b)) => Payload::Global(b),
+                        Some(None) => return Snapshot::Unrestorable("it is too large".into()),
                         None => {
                             return Snapshot::Unrestorable(format!("format {format} couldn't be read"))
                         }
@@ -451,24 +498,52 @@ mod platform {
         Snapshot::Saved(Saved { contents: Contents(saved), formats, bytes })
     }
 
+    /// Global memory holding a copy of `bytes`; freed when dropped unless it
+    /// was handed to the clipboard.
+    struct Global(HANDLE);
+
+    impl Global {
+        unsafe fn new(bytes: &[u8]) -> Option<Self> {
+            let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
+            if handle.is_null() {
+                return None;
+            }
+            let ptr = GlobalLock(handle) as *mut u8;
+            if ptr.is_null() {
+                GlobalFree(handle);
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            GlobalUnlock(handle);
+            Some(Self(handle))
+        }
+
+        unsafe fn text(text: &str) -> Option<Self> {
+            let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            Self::new(std::slice::from_raw_parts(units.as_ptr() as *const u8, units.len() * 2))
+        }
+
+        /// Hands it to the clipboard; the system owns it on success.
+        unsafe fn set(self, format: u32) -> bool {
+            let handle = self.0;
+            std::mem::forget(self);
+            if SetClipboardData(format, handle).is_null() {
+                GlobalFree(handle);
+                return false;
+            }
+            true
+        }
+    }
+
+    impl Drop for Global {
+        fn drop(&mut self) {
+            unsafe { GlobalFree(self.0) };
+        }
+    }
+
     /// Sets one format from bytes. The system owns the memory on success.
     unsafe fn set_global(format: u32, bytes: &[u8]) -> bool {
-        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
-        if handle.is_null() {
-            return false;
-        }
-        let ptr = GlobalLock(handle) as *mut u8;
-        if ptr.is_null() {
-            GlobalFree(handle);
-            return false;
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-        GlobalUnlock(handle);
-        if SetClipboardData(format, handle).is_null() {
-            GlobalFree(handle);
-            return false;
-        }
-        true
+        Global::new(bytes).is_some_and(|g| g.set(format))
     }
 
     unsafe fn set_emf(bytes: &[u8]) -> bool {
@@ -483,19 +558,15 @@ mod platform {
         true
     }
 
-    unsafe fn set_text(text: &str) -> bool {
-        let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let bytes = std::slice::from_raw_parts(units.as_ptr() as *const u8, units.len() * 2);
-        set_global(CF_UNICODETEXT, bytes)
-    }
-
     /// Sets the named formats with a DWORD 0 (Clipboard Formats, "Cloud
-    /// Clipboard and Clipboard History Formats").
+    /// Clipboard and Clipboard History Formats"). A marker that can't be set
+    /// is logged: the text then reaches clipboard history, as before 0.9.23.
     unsafe fn set_markers(names: &[&str]) {
         let zero = 0u32.to_ne_bytes();
         for name in names {
-            if let Some(format) = register(name) {
-                set_global(format, &zero);
+            let ok = register(name).is_some_and(|format| set_global(format, &zero));
+            if !ok {
+                log::warn!("[paste] clipboard marker {name} couldn't be set");
             }
         }
     }
@@ -516,10 +587,14 @@ mod platform {
             return Err("the clipboard is busy".into());
         };
         unsafe {
+            // Allocated before clearing, so a failure leaves the clipboard as it was.
+            let Some(text) = Global::text(text) else {
+                return Err("no memory for the text".into());
+            };
             if EmptyClipboard() == 0 {
                 return Err("the clipboard couldn't be cleared".into());
             }
-            if !set_text(text) {
+            if !text.set(CF_UNICODETEXT) {
                 return Err("the text couldn't be put on the clipboard".into());
             }
             if transient {
@@ -540,14 +615,17 @@ mod platform {
             }
         }
         unsafe {
-            if EmptyClipboard() == 0 || !set_text(text) {
+            let Some(text) = Global::text(text) else {
+                return Restored::NotOpened("no memory for the text".into());
+            };
+            if EmptyClipboard() == 0 || !text.set(CF_UNICODETEXT) {
                 return Restored::NotOpened("the clipboard couldn't be written".into());
             }
         }
         Restored::All
     }
 
-    pub fn restore(contents: Contents, seq_after_write: u64, transcript: &str) -> Restored {
+    pub fn restore(contents: &Contents, seq_after_write: u64, transcript: &str) -> Restored {
         let Some(_open) = Open::new() else {
             return Restored::NotOpened("the clipboard was busy".into());
         };
@@ -557,6 +635,10 @@ mod platform {
             return Restored::ChangedSince;
         }
         unsafe {
+            // The fallback is allocated before clearing.
+            let Some(fallback) = Global::text(transcript) else {
+                return Restored::NotOpened("no memory to restore with".into());
+            };
             if EmptyClipboard() == 0 {
                 return Restored::NotOpened("the clipboard couldn't be cleared".into());
             }
@@ -577,8 +659,11 @@ mod platform {
                 // Never an empty clipboard: the transcript goes back, in the
                 // same open session.
                 EmptyClipboard();
-                set_text(transcript);
+                if !fallback.set(CF_UNICODETEXT) {
+                    return Restored::NotOpened("nothing could be written back".into());
+                }
             } else {
+                drop(fallback);
                 set_markers(RESTORED);
             }
             result
@@ -632,6 +717,10 @@ mod platform {
         pasteboard.changeCount() as u64
     }
 
+    pub fn sequence() -> Option<u64> {
+        autoreleasepool(|_| Some(change_count(&general())))
+    }
+
     pub fn snapshot(budget: Duration, max_bytes: usize) -> Snapshot {
         autoreleasepool(|_| {
             let started = Instant::now();
@@ -664,11 +753,11 @@ mod platform {
                     let Some(data) = item.dataForType(&t) else {
                         return Snapshot::Unrestorable("a type gave no data".into());
                     };
-                    let data = data.to_vec();
-                    bytes += data.len();
-                    if bytes > max_bytes {
+                    if bytes + data.len() > max_bytes {
                         return Snapshot::Unrestorable("it is too large".into());
                     }
+                    let data = data.to_vec();
+                    bytes += data.len();
                     formats += 1;
                     types.push((t.to_string(), data));
                 }
@@ -684,14 +773,17 @@ mod platform {
         })
     }
 
-    fn write_items(pasteboard: &NSPasteboard, items: Vec<Retained<NSPasteboardItem>>) -> bool {
+    /// Clears the pasteboard and writes the items. Returns the change count
+    /// that clearing gave this write (Apple: the count to compare later to
+    /// know whether we still own the pasteboard), or None if it failed.
+    fn write_items(pasteboard: &NSPasteboard, items: Vec<Retained<NSPasteboardItem>>) -> Option<u64> {
         // This Mac only: what VoiceLnq writes is never sent to other devices
         // (Universal Clipboard).
-        pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+        let owned = pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
         let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
             items.into_iter().map(ProtocolObject::from_retained).collect();
         let array = NSArray::from_retained_slice(&objects);
-        pasteboard.writeObjects(&array)
+        pasteboard.writeObjects(&array).then_some(owned as u64)
     }
 
     fn text_item(text: &str, transient: bool) -> Retained<NSPasteboardItem> {
@@ -711,10 +803,9 @@ mod platform {
     pub fn write_text(text: &str, transient: bool) -> Result<Option<u64>, String> {
         autoreleasepool(|_| {
             let pasteboard = general();
-            if write_items(&pasteboard, vec![text_item(text, transient)]) {
-                Ok(Some(change_count(&pasteboard)))
-            } else {
-                Err("the text couldn't be put on the clipboard".into())
+            match write_items(&pasteboard, vec![text_item(text, transient)]) {
+                Some(owned) => Ok(Some(owned)),
+                None => Err("the text couldn't be put on the clipboard".into()),
             }
         })
     }
@@ -727,7 +818,7 @@ mod platform {
                     return Restored::ChangedSince;
                 }
             }
-            if write_items(&pasteboard, vec![text_item(text, false)]) {
+            if write_items(&pasteboard, vec![text_item(text, false)]).is_some() {
                 Restored::All
             } else {
                 Restored::NotOpened("the clipboard couldn't be written".into())
@@ -735,7 +826,7 @@ mod platform {
         })
     }
 
-    pub fn restore(contents: Contents, seq_after_write: u64, transcript: &str) -> Restored {
+    pub fn restore(contents: &Contents, seq_after_write: u64, transcript: &str) -> Restored {
         autoreleasepool(|_| {
             let pasteboard = general();
             // New items every time: an item that was on a pasteboard can't be
@@ -758,11 +849,13 @@ mod platform {
             if !still_ours(seq_after_write, Some(change_count(&pasteboard))) {
                 return Restored::ChangedSince;
             }
-            if written > 0 && write_items(&pasteboard, items) {
+            if written > 0 && write_items(&pasteboard, items).is_some() {
                 return restore_result(written, failed);
             }
             // Never an empty clipboard: the transcript goes back.
-            write_items(&pasteboard, vec![text_item(transcript, false)]);
+            if write_items(&pasteboard, vec![text_item(transcript, false)]).is_none() {
+                return Restored::NotOpened("nothing could be written back".into());
+            }
             Restored::TranscriptBack
         })
     }
@@ -778,6 +871,10 @@ mod platform {
 
     pub struct Contents;
 
+    pub fn sequence() -> Option<u64> {
+        None
+    }
+
     pub fn snapshot(_budget: Duration, _max_bytes: usize) -> Snapshot {
         Snapshot::Unrestorable("not supported on this platform".into())
     }
@@ -790,7 +887,7 @@ mod platform {
         Restored::NotOpened("not supported on this platform".into())
     }
 
-    pub fn restore(_contents: Contents, _seq: u64, _transcript: &str) -> Restored {
+    pub fn restore(_contents: &Contents, _seq: u64, _transcript: &str) -> Restored {
         Restored::NotOpened("not supported on this platform".into())
     }
 
@@ -805,12 +902,28 @@ mod tests {
 
     #[test]
     fn a_saved_clipboard_is_put_back_only_after_a_paste_that_was_sent_and_answered() {
-        assert_eq!(after_paste(true, Some(5), true), AfterPaste::Restore);
-        assert!(matches!(after_paste(false, Some(5), true), AfterPaste::KeepTranscript(_)));
+        assert_eq!(after_paste(true, true, Some(5), true), AfterPaste::Restore);
+        assert!(matches!(after_paste(false, true, Some(5), true), AfterPaste::KeepTranscript(_)));
+        // The guard's field check no longer said "editable".
+        assert!(matches!(after_paste(true, false, Some(5), true), AfterPaste::KeepTranscript(_)));
         // No sequence to compare later: never restore blind.
-        assert!(matches!(after_paste(true, None, true), AfterPaste::KeepTranscript(_)));
+        assert!(matches!(after_paste(true, true, None, true), AfterPaste::KeepTranscript(_)));
         // A hung or busy app may read the clipboard late: keep the transcript.
-        assert!(matches!(after_paste(true, Some(5), false), AfterPaste::KeepTranscript(_)));
+        assert!(matches!(after_paste(true, true, Some(5), false), AfterPaste::KeepTranscript(_)));
+    }
+
+    #[test]
+    fn a_confident_paste_is_put_back_only_while_the_field_still_takes_text() {
+        use crate::context::FocusField::*;
+        assert!(restore_allowed(RestoreWhen::IfEditable, Some(Editable)));
+        for field in [Some(NotEditable), Some(Unknown), None] {
+            assert!(!restore_allowed(RestoreWhen::IfEditable, field), "{field:?}");
+            // A known terminal or Paste last transcription: always.
+            assert!(restore_allowed(RestoreWhen::Always, field), "{field:?}");
+        }
+        let parse = |s: &str| serde_json::from_str::<RestoreWhen>(s).unwrap();
+        assert_eq!(parse("\"if-editable\""), RestoreWhen::IfEditable);
+        assert_eq!(parse("\"always\""), RestoreWhen::Always);
     }
 
     #[test]

@@ -4,6 +4,7 @@ import type {
 	NativePasteResult,
 	PasteBinding,
 	PasteShortcut,
+	RestoreWhen,
 } from '$lib/privacy/policy';
 import type { MaybePromise, WhisperingError } from '$lib/result';
 
@@ -29,11 +30,11 @@ export type TextService = {
 	 * Puts the text on the clipboard and, with a binding, pastes it at the
 	 * cursor (Cmd+V on macOS, Ctrl+V elsewhere, Shift+Insert for mintty).
 	 *
-	 * VoiceFlow 0.9.23: with `keepClipboard`, a paste puts the person's own
+	 * VoiceFlow 0.9.23: with `restore`, a paste puts the person's own
 	 * clipboard back once the app has read the text (best effort: when it
-	 * can't be put back, the text stays). Without it, or when nothing is
-	 * pasted, the text stays on the clipboard. Without a binding it is only
-	 * copied.
+	 * can't be put back, the text stays). Without it (an unsure paste, or the
+	 * setting off), or when nothing is pasted, the text stays on the
+	 * clipboard. Without a binding it is only copied.
 	 *
 	 * @param text The text to write at the cursor position.
 	 */
@@ -46,8 +47,8 @@ export type TextService = {
 		 */
 		binding?: PasteBinding,
 		shortcut?: PasteShortcut,
-		/** VoiceFlow 0.9.23: put the previous clipboard back after a paste. */
-		keepClipboard?: boolean,
+		/** VoiceFlow 0.9.23: when the previous clipboard is put back after a paste. */
+		restore?: RestoreWhen,
 	) => MaybePromise<Result<PasteOutcome, TextServiceError | WhisperingError>>;
 
 	/**

@@ -1,4 +1,4 @@
-import type { PasteBinding, PasteShortcut } from '$lib/privacy/policy';
+import type { PasteBinding, PasteShortcut, RestoreWhen } from '$lib/privacy/policy';
 import { defineMutation, defineQuery } from '$lib/query/client';
 import { services } from '$lib/services';
 
@@ -26,20 +26,20 @@ export const text = {
 			text,
 			binding,
 			shortcut,
-			keepClipboard,
+			restore,
 		}: {
 			text: string;
 			/** VoiceFlow: the window the paste was authorized for; none: copy only. */
 			binding?: PasteBinding;
 			/** VoiceFlow 0.9.11: the paste keys (Shift+Insert for mintty). */
 			shortcut?: PasteShortcut;
-			/** VoiceFlow 0.9.23: put the previous clipboard back after a paste. */
-			keepClipboard?: boolean;
+			/** VoiceFlow 0.9.23: when the previous clipboard is put back after a paste. */
+			restore?: RestoreWhen;
 		}) => {
 			// VoiceFlow 0.9.11: writes the clipboard, re-checks the window, sends
-			// the paste keys. 0.9.23: with keepClipboard, the previous clipboard
-			// is put back after a paste; otherwise the text stays there.
-			return await services.text.writeToCursor(text, binding, shortcut, keepClipboard);
+			// the paste keys. 0.9.23: with restore, the previous clipboard is
+			// put back after a paste; otherwise the text stays there.
+			return await services.text.writeToCursor(text, binding, shortcut, restore);
 		},
 	}),
 	simulateEnterKeystroke: defineMutation({

@@ -78,18 +78,27 @@ export type TargetSnapshot = {
 	higherIntegrity?: boolean | null;
 	/**
 	 * VoiceFlow 0.9.23: whether the focused element takes text, read at paste
-	 * time only where that answer is trusted (File Explorer and Finder, which
-	 * also owns the macOS desktop). null or absent: not checked.
+	 * time (the hotkey doesn't ask). null or absent: not checked.
 	 */
 	focusField?: FocusField | null;
 };
 
 /**
  * VoiceFlow 0.9.23: the focused element at paste time. `not-editable` is a
- * positive answer (a file list, a breadcrumb); `unknown` means the check
- * couldn't tell and never stops a paste.
+ * positive answer (a file list, a breadcrumb, a read-only page); `unknown`
+ * means the check couldn't tell. Only in File Explorer or Finder does
+ * `not-editable` stop a paste.
  */
 export type FocusField = 'editable' | 'not-editable' | 'unknown';
+
+/**
+ * VoiceFlow 0.9.23, when a paste's clipboard is put back (Rust
+ * `clipboard_keep::RestoreWhen`): `if-editable` when the field check said
+ * the field takes text (put back only if the check right before the
+ * keystroke still says so); `always` for a known terminal and for Paste last
+ * transcription. No mode: an unsure paste, whose text stays on the clipboard.
+ */
+export type RestoreWhen = 'if-editable' | 'always';
 
 export type RecordDecision = {
 	/** allow: record and upload. refuse: don't record. */
@@ -295,10 +304,18 @@ export type PasteDecision = {
 	binding?: PasteBinding;
 	shortcut?: PasteShortcut;
 	/**
-	 * 0.9.23, set when the paste is allowed: false for a remote desktop or
-	 * virtual machine, whose paste keeps the text on the clipboard.
+	 * 0.9.23, set when the paste is allowed. `confident`: the field takes
+	 * text (or a known terminal); `unsure`: it may not, so the text stays on
+	 * the clipboard after the paste.
 	 */
-	restoresClipboard?: boolean;
+	confidence?: 'confident' | 'unsure';
+	/**
+	 * 0.9.23: when the clipboard is put back after this paste; absent for an
+	 * unsure paste and for a remote desktop or virtual machine.
+	 */
+	restore?: RestoreWhen;
+	/** 0.9.23: a remote desktop or VM: its clipboard is never put back. */
+	lateReader?: boolean;
 	/** "Ctrl+V" or "Cmd+V", for the notice. */
 	keys: string;
 };
@@ -310,7 +327,7 @@ export type PasteBinding = {
 };
 
 /** Why the native paste stopped just before the keystroke (Rust `PasteRefusal`). */
-export type PasteRefusal = 'target-changed' | 'password-field';
+export type PasteRefusal = 'target-changed' | 'password-field' | 'no-field';
 
 /** Same window: the handle on Windows, the process on macOS. */
 export function sameWindow(
@@ -378,8 +395,9 @@ export function decidePaste({
 	if (current.isSelf) return copy('self');
 	if (findBlockedApp(current)) return copy('blocked-app');
 	if (current.passwordCheck === 'password') return copy('password-field');
-	// 0.9.23: only a positive "no text field" counts; unknown pastes.
-	if (current.focusField === 'not-editable') return copy('no-field');
+	// 0.9.23: nowhere to paste, only where "no text field" is trustworthy
+	// (File Explorer, Finder). Elsewhere it is an unsure paste.
+	if (isFileManager(current) && current.focusField === 'not-editable') return copy('no-field');
 	if (atStop && !sameWindow(atStop, current)) return copy('moved');
 	if (current.higherIntegrity === true) return copy('elevated');
 	if (current.platform === 'windows' && current.higherIntegrity === null) {
@@ -393,8 +411,77 @@ export function decidePaste({
 		keys,
 		binding: { windowId: current.windowId, pid: current.pid },
 		shortcut: pasteShortcutFor(current),
-		restoresClipboard: !readsClipboardLate(current),
+		...pasteConfidence(current),
 	};
+}
+
+/**
+ * VoiceFlow 0.9.23: how sure a paste is to land, and so whether the
+ * person's clipboard is put back afterwards.
+ * - Confident: the field check says the focused element takes text, or the
+ *   app is a terminal where the paste keys always paste. The clipboard is
+ *   put back.
+ * - Unsure: anything else (an app whose focus doesn't read as a text field:
+ *   some Electron or Chromium views, games, spreadsheet cells). It is still
+ *   pasted, but the text stays on the clipboard, so a paste that silently
+ *   went nowhere can be pasted by hand.
+ * A remote desktop or virtual machine never gets its clipboard put back.
+ */
+export function pasteConfidence(
+	current: Pick<TargetSnapshot, 'exeName' | 'bundleId' | 'windowClass' | 'focusField'>,
+): Pick<PasteDecision, 'confidence' | 'restore' | 'lateReader'> {
+	const confident = current.focusField === 'editable' || isKnownTerminal(current);
+	if (readsClipboardLate(current)) {
+		return { confidence: confident ? 'confident' : 'unsure', lateReader: true };
+	}
+	if (!confident) return { confidence: 'unsure' };
+	return { confidence: 'confident', restore: current.focusField === 'editable' ? 'if-editable' : 'always' };
+}
+
+/**
+ * VoiceFlow 0.9.23: the restore mode `write_text` is given for a delivery.
+ * None when nothing is pasted, the setting is off, or the app reads the
+ * clipboard late. `always`: Paste last transcription, which the person asked
+ * for into the field in front, so it borrows the clipboard like a confident
+ * paste even when the field check is unsure.
+ */
+export function restoreFor(
+	decision: Pick<PasteDecision, 'paste' | 'restore' | 'lateReader'>,
+	keepClipboard: boolean,
+	always = false,
+): RestoreWhen | undefined {
+	if (!decision.paste || !keepClipboard || decision.lateReader) return undefined;
+	return always ? 'always' : decision.restore;
+}
+
+/** File Explorer (explorer.exe, the desktop too) and Finder. */
+export function isFileManager(target: Pick<TargetSnapshot, 'exeName' | 'bundleId'>): boolean {
+	return (
+		target.exeName?.toLowerCase() === 'explorer.exe' ||
+		target.bundleId?.toLowerCase() === 'com.apple.finder'
+	);
+}
+
+/**
+ * Terminals where the paste keys paste: Windows Terminal (Ctrl+V is bound to
+ * paste by default), mintty (VoiceLnq sends Shift+Insert there),
+ * Terminal.app and iTerm2 (Cmd+V, the Edit menu). The classic console is
+ * not on the list: whether it takes Ctrl+V depends on its settings and the
+ * program running in it, so it is an unsure paste.
+ */
+export function isKnownTerminal(
+	target: Pick<TargetSnapshot, 'exeName' | 'bundleId' | 'windowClass'>,
+): boolean {
+	const exe = target.exeName?.toLowerCase();
+	const bundle = target.bundleId?.toLowerCase();
+	const windowClass = target.windowClass?.toLowerCase();
+	return (
+		exe === 'windowsterminal.exe' ||
+		exe === 'mintty.exe' ||
+		windowClass === 'cascadia_hosting_window_class' ||
+		bundle === 'com.apple.terminal' ||
+		bundle === 'com.googlecode.iterm2'
+	);
 }
 
 /**

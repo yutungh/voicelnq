@@ -338,14 +338,22 @@ const PASTE_SETTLE_MS: u64 = 150;
 /// VoiceFlow 0.9.11: when nothing is pasted (a refusal, keys that couldn't
 /// be sent), the text stays on the clipboard so the person can press Ctrl+V.
 ///
-/// VoiceFlow 0.9.23, `keep_clipboard` (Settings: Keep my clipboard after
-/// pasting): the clipboard is saved first (`clipboard_keep`), the text goes
-/// on it marked as transient, and after the paste the saved clipboard is put
-/// back in the background, once the app has had time to read the text and
-/// only if nothing else wrote the clipboard since. This never changes the
-/// result: a restore that can't happen leaves the text on the clipboard.
-/// Without `keep_clipboard`, or when the clipboard can't be saved
-/// faithfully, the text stays on the clipboard after a paste, as in 0.9.11.
+/// VoiceFlow 0.9.23, `restore` (Settings: Keep my clipboard after pasting,
+/// for a paste the rule is confident about): the clipboard is saved first
+/// (`clipboard_keep`), the text goes on it marked as transient, and after
+/// the paste the saved clipboard is put back in the background, once the app
+/// has had time to read the text and only if nothing else wrote the
+/// clipboard since. `if-editable` is put back only if the field check right
+/// before the keystroke still says the field takes text. This never changes
+/// the result: a restore that can't happen leaves the text on the clipboard.
+/// Without `restore` (an unsure paste, or the setting off), or when the
+/// clipboard can't be saved faithfully, the text stays on the clipboard
+/// after a paste, as in 0.9.11.
+///
+/// 0.9.23: the paste keys wait (up to `MODIFIERS_WAIT`) for the person's own
+/// Ctrl, Alt, Shift and Win/Cmd keys to come up: "Paste last transcription"
+/// is itself a shortcut, and Ctrl+V sent while Alt is still held is
+/// Ctrl+Alt+V, which pastes nothing.
 ///
 /// With a `binding` (the window the paste was authorized for), the app in
 /// front and its focused field are checked again right before the keystroke;
@@ -360,14 +368,24 @@ async fn write_text(
     text: String,
     binding: Option<context::PasteBinding>,
     shortcut: Option<PasteShortcut>,
-    keep_clipboard: Option<bool>,
+    restore: Option<clipboard_keep::RestoreWhen>,
 ) -> Result<PasteResult, String> {
     let one_at_a_time = PASTE_LOCK.clone().lock_owned().await;
 
+    // 0.9.23: the person's own modifier keys come up before anything else
+    // ("Paste last transcription" is itself a shortcut). Still held: no
+    // paste, the text is only copied.
+    let modifiers_up = match binding {
+        Some(_) => tokio::task::spawn_blocking(|| wait_for_modifiers_up(MODIFIERS_WAIT))
+            .await
+            .unwrap_or(false),
+        None => true,
+    };
+
     // 0.9.23: save the clipboard, and write the text marked as transient,
-    // only when a paste will be tried and the clipboard can be put back.
+    // only when a confident paste will be tried and the clipboard can be put back.
     let mut kept: Option<(clipboard_keep::Saved, Option<u64>)> = None;
-    if keep_clipboard == Some(true) && binding.is_some() {
+    if restore.is_some() && binding.is_some() && modifiers_up {
         let transcript = text.clone();
         kept = tokio::task::spawn_blocking(move || {
             match clipboard_keep::snapshot() {
@@ -399,6 +417,10 @@ async fn write_text(
             return Ok(PasteResult::failed(false, format!("Couldn't use the clipboard: {e}")));
         }
     }
+    // 0.9.23: for a paste whose clipboard comes back, what the clipboard
+    // must still be at the keystroke. (Not for the plain write: a clipboard
+    // tool that rewrites every copy would then stop every paste.)
+    let written = kept.as_ref().and_then(|(_, seq)| *seq);
 
     // No fixed wait on Windows and macOS. arboard sets the text synchronously
     // there (Windows: OpenClipboard, SetClipboardData with the real data,
@@ -412,25 +434,38 @@ async fn write_text(
     let Some(binding) = binding else {
         return Ok(PasteResult::copied(None));
     };
+    if !modifiers_up {
+        log::warn!("[paste] a modifier key was still held; copied instead");
+        return Ok(PasteResult::failed(true, "A key was still held down, so VoiceLnq didn't paste.".into()));
+    }
     let shortcut = shortcut.unwrap_or_default();
     let window_id = binding.window_id.clone();
 
     // The window check and the keystroke run in one blocking step, nothing in
     // between, so the paste goes only to the window it was authorized for
     // (spec §4.3).
-    let pressed = tokio::task::spawn_blocking(move || -> KeyOutcome {
-        let (verdict, _password) = context::verify_paste_binding(&binding);
+    let (pressed, field) = tokio::task::spawn_blocking(move || -> (KeyOutcome, Option<context::FocusField>) {
+        let (verdict, _password, field) = context::verify_paste_binding(&binding);
         if let Err(reason) = verdict {
-            return KeyOutcome::Refused(reason);
+            return (KeyOutcome::Refused(reason), field);
+        }
+        // 0.9.23: checked again right before the keys. A key pressed during
+        // the check would change what Ctrl+V does; a copy made during it
+        // would paste the wrong text.
+        if modifiers_held() {
+            return (KeyOutcome::NotSent("A key was held down just before the paste.".into()), field);
+        }
+        if written.is_some() && clipboard_keep::sequence() != written {
+            return (KeyOutcome::NotSent("The clipboard changed just before the paste.".into()), field);
         }
         let mut enigo = match Enigo::new(&Settings::default()) {
             Ok(enigo) => enigo,
-            Err(e) => return KeyOutcome::NotSent(e.to_string()),
+            Err(e) => return (KeyOutcome::NotSent(e.to_string()), field),
         };
-        press_paste_keys(&mut enigo, shortcut)
+        (press_paste_keys(&mut enigo, shortcut), field)
     })
     .await
-    .unwrap_or_else(|e| KeyOutcome::NotSent(format!("Paste task failed: {e}")));
+    .unwrap_or_else(|e| (KeyOutcome::NotSent(format!("Paste task failed: {e}")), None));
 
     let keys_sent = matches!(pressed, KeyOutcome::Sent { .. });
     if keys_sent {
@@ -443,9 +478,10 @@ async fn write_text(
         // 0.9.23: put the clipboard back later, holding the lock until then.
         Some((saved, seq)) if keys_sent => {
             let transcript = text.clone();
+            let allowed = restore.is_some_and(|mode| clipboard_keep::restore_allowed(mode, field));
             tauri::async_runtime::spawn(async move {
                 let _held = one_at_a_time;
-                put_clipboard_back(saved, seq, window_id, transcript).await;
+                put_clipboard_back(saved, seq, allowed, window_id, transcript).await;
             });
         }
         // Nothing was pasted: the text stays, as an ordinary clipboard entry.
@@ -483,6 +519,7 @@ async fn write_text(
 async fn put_clipboard_back(
     saved: clipboard_keep::Saved,
     seq: Option<u64>,
+    allowed: bool,
     window_id: Option<String>,
     transcript: String,
 ) {
@@ -491,21 +528,86 @@ async fn put_clipboard_back(
         .await
         .unwrap_or(false);
     tokio::time::sleep(clipboard_keep::RESTORE_DELAY.saturating_sub(waited)).await;
-    let outcome = tokio::task::spawn_blocking(move || {
-        match clipboard_keep::after_paste(true, seq, answered) {
+    let step = clipboard_keep::after_paste(true, allowed, seq, answered);
+    let what = match step {
+        clipboard_keep::AfterPaste::Restore => "put back".to_string(),
+        clipboard_keep::AfterPaste::KeepTranscript(why) => format!("not put back ({why}); the text stays"),
+    };
+    let saved = std::sync::Arc::new(saved);
+    // Another app may hold the clipboard for a moment: try again a few times.
+    // Each try checks the sequence again, so a newer copy is never replaced.
+    for attempt in 1..=RESTORE_ATTEMPTS {
+        let (saved, text) = (saved.clone(), transcript.clone());
+        let outcome = tokio::task::spawn_blocking(move || match step {
             clipboard_keep::AfterPaste::Restore => {
                 let seq = seq.expect("after_paste restores only with a sequence");
-                format!("put back: {:?}", clipboard_keep::restore(saved, seq, &transcript))
+                clipboard_keep::restore(&saved, seq, &text)
             }
-            clipboard_keep::AfterPaste::KeepTranscript(why) => format!(
-                "not put back ({why}); the text stays: {:?}",
-                clipboard_keep::keep_transcript(&transcript, seq)
-            ),
+            clipboard_keep::AfterPaste::KeepTranscript(_) => clipboard_keep::keep_transcript(&text, seq),
+        })
+        .await;
+        match outcome {
+            Ok(clipboard_keep::Restored::NotOpened(why)) if attempt < RESTORE_ATTEMPTS => {
+                log::info!("[paste] clipboard {what}: busy ({why}), trying again");
+                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+            }
+            Ok(outcome) => {
+                log::info!("[paste] clipboard {what}: {outcome:?}");
+                return;
+            }
+            Err(e) => {
+                log::warn!("[paste] clipboard restore task failed: {e}");
+                return;
+            }
         }
-    })
-    .await
-    .unwrap_or_else(|e| format!("restore task failed: {e}"));
-    log::info!("[paste] clipboard {outcome}");
+    }
+}
+
+/// How many times a busy clipboard is tried when putting it back.
+const RESTORE_ATTEMPTS: u32 = 3;
+
+/// How long the paste keys wait for the person's own modifier keys to come up.
+const MODIFIERS_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Waits until no Ctrl, Alt, Shift or Win/Cmd key is held, up to `timeout`.
+/// True when they are all up.
+fn wait_for_modifiers_up(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !modifiers_held() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn modifiers_held() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+    [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+        .iter()
+        .any(|&vk| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn modifiers_held() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+    // kCGEventSourceStateCombinedSessionState; shift, control, option, command.
+    const HELD: u64 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000;
+    unsafe { CGEventSourceFlagsState(0) & HELD != 0 }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn modifiers_held() -> bool {
+    false
 }
 
 /// Which keys paste. Most apps take Ctrl+V; mintty (Git Bash) pastes with
